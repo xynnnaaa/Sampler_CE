@@ -695,19 +695,21 @@ class JoinSampler:
             uncovered_mask_int |= (1 << qid)
 
         try:
+            root_real_name = template_data['real_names'][root_table]
             if self.workload_name:
                 temp_T_name = "temp_T_" + self.workload_name
                 temp_T_new_name = "temp_T_new_" + self.workload_name
+                root_sidecar = f"{root_real_name}_anno_idx_{self.workload_name}"
             else:
                 temp_T_name = "temp_T"
                 temp_T_new_name = "temp_T_new"
+                root_sidecar = f"{root_real_name}_anno_idx"
             self.cursor.execute(f"DROP TABLE IF EXISTS {temp_T_name};")
 
             if not partition_ids: return None
 
             current_id_cols = []
 
-            root_real_name = template_data['real_names'][root_table]
             root_sels = join_graph.nodes[root_table]['sels']
 
             root_cols = []
@@ -739,9 +741,9 @@ class JoinSampler:
                 ids_values = ",".join(f"({uid})" for uid in partition_ids)
                 fetch_sql = f"""
                     WITH partition_filter(pid) AS ( VALUES {ids_values} )
-                    SELECT {root_select_str}, {root_anno_col}::text
-                    FROM {root_real_name} AS {root_table}
-                    JOIN partition_filter pf ON {root_table}.id = pf.pid
+                    SELECT t.anno_id, t.anno::text
+                    FROM {root_sidecar} t
+                    JOIN partition_filter pf ON t.anno_id = pf.pid
                 """
                 t1_execute = time.time()
                 self.cursor.execute(fetch_sql)
@@ -759,8 +761,6 @@ class JoinSampler:
                     pk_id = row[id_idx]
                     anno_str = row[-1]
                     qid_mask = self._translate_pid_bitmap(anno_str, r_map, r_global)
-                    # score = bin(qid_mask & uncovered_mask_int).count('1')
-                    # scored_candidates.append((score, row_data, qid_mask))
                     cached_pairs.append((pk_id, qid_mask))
                 print(f"                Translated PID to QID in {time.time() - t2:.2f}s.")
 
@@ -820,6 +820,11 @@ class JoinSampler:
             for step in join_tree[1:]:
                 next_alias = step['alias']
                 real_name = step['real_name']
+                if self.workload_name:
+                    next_sidecar = f"{real_name}_anno_idx_{self.workload_name}"
+                else:
+                    next_sidecar = f"{real_name}_anno_idx"
+
                 parent_alias = step['parent']
                 raw_join_cond = step['join_condition'] # e.g., "t.id = mi.movie_id"
 
@@ -843,11 +848,11 @@ class JoinSampler:
                     SELECT
                         {prev_select_str},
                         {next_select_str},
-                        {next_alias}.anno::text,
+                        sa.anno::text,
                         T_tmp.anno::text
                     FROM {temp_T_name} T_tmp
-                    JOIN {real_name} AS {next_alias}
-                    ON {fixed_join_cond};
+                    JOIN {real_name} AS {next_alias} ON {fixed_join_cond}
+                    JOIN {next_sidecar} sa ON {next_alias}.id = sa.anno_id;
                 """
                 t5_execute = time.time()
                 self.cursor.execute(fetch_join_sql)
@@ -928,39 +933,6 @@ class JoinSampler:
                 t8 = time.time()
                 execute_values(self.cursor, insert_sql, insert_values)
                 print(f"            Inserted top-{len(top_k)} candidates into '{temp_T_name}' after joining '{next_alias}' in {time.time() - t8:.2f}s.")
-
-            # # check，一定选出的是top_k中的第一个吗？
-            # self.cursor.execute(f"SELECT * FROM {temp_T_name} LIMIT 1;")
-            # row = self.cursor.fetchone()
-
-            # if row is None:
-            #     return None
-            
-            # # 提取所有id列，把“_id”结尾的列都当成 id 列
-            # # check 这个列名提取方式对吗？
-            # full_row_ids = {}
-            # col_names = [desc[0] for desc in self.cursor.description]
-            # anno_bits = row[-1] # 最后一列是 anno
-
-            # for i, col_name in enumerate(col_names[:-1]):
-            #     if col_name.endswith("_id") or col_name.endswith("_Id"):
-            #         for alias in join_graph.nodes:
-            #             if col_name == f"{alias}_id" or col_name == f"{alias}_Id":
-            #                 full_row_ids[alias] = row[i]
-            #                 break
-
-            # # check
-            # covered_indices = set()
-            # if anno_bits:
-            #     for idx, bit in enumerate(anno_bits):
-            #         if bit == '1':
-            #             qid = total_queries - 1 - idx
-            #             covered_indices.add(qid)
-            
-            # return {
-            #     'full_row': full_row_ids,
-            #     'covered_indices': covered_indices
-            # }
         
         except Exception as e:
             self.conn.rollback()
