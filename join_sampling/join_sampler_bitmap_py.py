@@ -12,6 +12,7 @@ import time
 import json
 import psycopg2
 from psycopg2.extras import execute_values
+from concurrent.futures import ProcessPoolExecutor
 import sys
 import re
 
@@ -39,6 +40,39 @@ def normalize_condition(cond_str):
     parts = [p.strip() for p in cond_str.split('=')]
     parts.sort()
     return "=".join(parts)
+
+
+_PID_QID_ARRAY = None
+_GLOBAL_MASK = None
+
+
+def init_worker(pid_qid_array, global_mask):
+    global _PID_QID_ARRAY, _GLOBAL_MASK
+    _PID_QID_ARRAY = pid_qid_array
+    _GLOBAL_MASK = global_mask
+
+
+def translate_pid_bitmap(pid_bitmap_str):
+    """
+    将数据库读出的 PID Bitmap (str) 翻译为 QID Bitmap (int).
+    Args:
+        pid_bitmap_str: 例如 '10100...' (Postgres BIT VARYING)
+        pid_map: { pid(int): qid_mask(int) }
+        global_mask_int: 该表的全局 QID Mask (int)
+    Returns:
+        qid_mask (int)
+    """
+    result_mask = _GLOBAL_MASK
+    
+    if not pid_bitmap_str:
+        return result_mask
+
+    pos = pid_bitmap_str.find('1')
+    while pos != -1:
+        result_mask |= _PID_QID_ARRAY.get(pos, 0)
+        pos = pid_bitmap_str.find('1', pos + 1)
+    
+    return result_mask
 
 TABLE_CARD = {
     "cast_info": 37610440,
@@ -313,27 +347,21 @@ class JoinSampler:
                 pid_map[alias][pid] = mask
 
         return pid_map, global_map
+
     
-    def _translate_pid_bitmap(self, pid_bitmap_str, pid_map, global_mask_int):
-        """
-        将数据库读出的 PID Bitmap (str) 翻译为 QID Bitmap (int).
-        Args:
-            pid_bitmap_str: 例如 '10100...' (Postgres BIT VARYING)
-            pid_map: { pid(int): qid_mask(int) }
-            global_mask_int: 该表的全局 QID Mask (int)
-        Returns:
-            qid_mask (int)
-        """
-        result_mask = global_mask_int
-        
-        if not pid_bitmap_str:
-            return result_mask
-        
-        for pid, char in enumerate(pid_bitmap_str):
-            if char == '1':
-                result_mask |= pid_map.get(pid, 0)
-        
-        return result_mask
+    def translate_all(self, rows, r_map, r_global, id_idx):
+        with ProcessPoolExecutor(
+            initializer=init_worker,
+            initargs=(r_map, r_global),
+        ) as executor:
+            qid_masks = list(
+                executor.map(translate_pid_bitmap, (row[-1] for row in rows))
+            )
+
+        return [
+            (row[id_idx], qid_mask)
+            for row, qid_mask in zip(rows, qid_masks)
+        ]
 
     def compute_root_weights(self):
         pass
@@ -587,13 +615,13 @@ class JoinSampler:
             zero_string = '0' * total_preds
 
             try:
-                # self.cursor.execute(f"SELECT to_regclass('{sidecar_name}');")
-                # if self.cursor.fetchone()[0] is not None:
-                #     print(f"        Skipping '{real_name}': Sidecar '{sidecar_name}' already exists.", flush=True)
-                #     continue
+                self.cursor.execute(f"SELECT to_regclass('{sidecar_name}');")
+                if self.cursor.fetchone()[0] is not None:
+                    print(f"        Skipping '{real_name}': Sidecar '{sidecar_name}' already exists.", flush=True)
+                    continue
 
-                self.cursor.execute(f"DROP TABLE IF EXISTS {sidecar_name}")
-                self.conn.commit()
+                # self.cursor.execute(f"DROP TABLE IF EXISTS {sidecar_name}")
+                # self.conn.commit()
 
                 create_sql = f"""
                     CREATE TABLE {sidecar_name} AS
@@ -757,11 +785,12 @@ class JoinSampler:
                 r_global = global_map.get(root_table, 0)
 
                 t2 = time.time()
-                for row in rows:
-                    pk_id = row[id_idx]
-                    anno_str = row[-1]
-                    qid_mask = self._translate_pid_bitmap(anno_str, r_map, r_global)
-                    cached_pairs.append((pk_id, qid_mask))
+                # for row in rows:
+                #     pk_id = row[id_idx]
+                #     anno_str = row[-1]
+                #     qid_mask = self._translate_pid_bitmap(anno_str, r_map, r_global)
+                #     cached_pairs.append((pk_id, qid_mask))
+                cached_pairs.extend(self.translate_all(rows, r_map, r_global, id_idx))
                 print(f"                Translated PID to QID in {time.time() - t2:.2f}s.")
 
                 if root_cache is not None:

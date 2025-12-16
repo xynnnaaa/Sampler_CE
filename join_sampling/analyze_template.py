@@ -328,6 +328,104 @@ class WorkloadAnalyzer:
                 f"templates={stats['templates']}, "
                 f"leaves={stats['leaves']}, "
                 f"queries={stats['queries']}")
+            
+
+    def load_one_template(self, template_name):
+        """
+        解析某一个完整查询 template（如 1a / 2b）
+        返回：
+            unique_templates
+            template_query_count
+        """
+        temp_groups = {}
+        template_query_count = defaultdict(int)
+
+        input_template_dir = os.path.join(self.base_query_dir, template_name)
+        pkl_files = sorted(glob.glob(os.path.join(input_template_dir, "*.pkl")))
+
+        for pkl_file in pkl_files:
+            try:
+                qrep = load_qrep(pkl_file)
+            except Exception:
+                continue
+
+            join_graph = qrep["join_graph"]
+            subset_graph = qrep["subset_graph"]
+
+            for subplan_tuple in sorted(subset_graph.nodes()):
+                if len(subplan_tuple) < 2:
+                    continue
+
+                sorted_aliases = tuple(sorted(subplan_tuple))
+                sub_graph = join_graph.subgraph(subplan_tuple)
+
+                edges_info = []
+                for u, v, data in sub_graph.edges(data=True):
+                    if u > v:
+                        u, v = v, u
+                    cond = normalize_condition(data.get("join_condition", ""))
+                    edges_info.append(f"{u}|{v}|{cond}")
+
+                edges_info.sort()
+                join_sig_str = "||".join(edges_info)
+                template_key = (sorted_aliases, join_sig_str)
+
+                if template_key not in temp_groups:
+                    temp_groups[template_key] = sub_graph.copy()
+
+                template_query_count[template_key] += 1
+
+        return temp_groups, template_query_count
+    
+    def analyze_one_template(self, template_name):
+        print(f"\nAnalyzing template {template_name}")
+
+        unique_templates, template_query_count = \
+            self.load_one_template(template_name)
+
+        trie = JoinPathTrie()
+
+        for idx, (key, sub_graph) in enumerate(unique_templates.items()):
+            aliases = list(key[0])
+
+            try:
+                path_signature = get_deterministic_execution_plan(sub_graph, aliases)
+            except Exception:
+                continue
+
+            template_id = f"T_{idx}"
+            trie.template_freq[template_id] = template_query_count[key]
+            trie.insert(template_id, path_signature)
+
+        leaf_cnt, total_cnt = trie.count_nodes()
+
+        print(f"Templates: {len(unique_templates)}")
+        print(f"Leaf nodes: {leaf_cnt}")
+        print(f"Total nodes: {total_cnt}")
+
+        subtree_stats = trie.count_root_subtrees()
+        return subtree_stats
+
+    def analyze_all_templates(self):
+        template_dirs = sorted([
+            d for d in os.listdir(self.base_query_dir)
+            if os.path.isdir(os.path.join(self.base_query_dir, d))
+        ])
+
+        for template_name in template_dirs:
+            if template_name == "7a" and self.skip_7a:
+                continue
+
+            stats = self.analyze_one_template(template_name)
+
+            print(f"Per-root stats for {template_name}:")
+            for step, s in stats.items():
+                print(
+                    f"{step}: nodes={s['nodes']}, "
+                    f"templates={s['templates']}, "
+                    f"leaves={s['leaves']}, "
+                    f"queries={s['queries']}"
+                )
 
 
 
@@ -337,17 +435,19 @@ if __name__ == "__main__":
     
     analyzer = WorkloadAnalyzer(BASE_DIR, skip_7a=True)
 
-    t1 = time.time()
+    # t1 = time.time()
     
-    analyzer.load_and_group_workload()
+    # analyzer.load_and_group_workload()
 
-    print(f"Load and parse workload in {time.time() - t1:.2f}s.")
+    # print(f"Load and parse workload in {time.time() - t1:.2f}s.")
 
-    t2 = time.time()
+    # t2 = time.time()
 
-    if analyzer.unique_templates:
-        analyzer.build_trie_and_count()
-    else:
-        print("No templates found to analyze.")
+    # if analyzer.unique_templates:
+    #     analyzer.build_trie_and_count()
+    # else:
+    #     print("No templates found to analyze.")
 
-    print(f"Build trie and count leaves in {time.time() - t2:.2f}s.")
+    # print(f"Build trie and count leaves in {time.time() - t2:.2f}s.")
+
+    analyzer.analyze_all_templates()
