@@ -597,11 +597,11 @@ class JoinSampler:
 
                 create_sql = f"""
                     CREATE TABLE {sidecar_name} AS
-                    SELECT id AS anno_id, B'{zero_string}'::{f"BIT VARYING({total_preds})"} AS anno
+                    SELECT id AS query_anno_id, B'{zero_string}'::{f"BIT VARYING({total_preds})"} AS query_anno
                     FROM {real_name}
                 """
                 self.cursor.execute(create_sql)
-                self.cursor.execute(f"ALTER TABLE {sidecar_name} ADD PRIMARY KEY (anno_id)")
+                self.cursor.execute(f"ALTER TABLE {sidecar_name} ADD PRIMARY KEY (query_anno_id)")
                 self.conn.commit()
 
                 self.cursor.execute(f"SELECT min(id), max(id) FROM {real_name}")
@@ -648,10 +648,10 @@ class JoinSampler:
                     for full_expr, pred_where in sql_chunks:
                         update_sql = f"""
                             UPDATE {sidecar_name} s
-                            SET anno = anno | ({full_expr})
+                            SET query_anno = query_anno | ({full_expr})
                             FROM {real_name} o
-                            WHERE s.anno_id = o.id
-                                AND s.anno_id >= {current_id} AND s.anno_id < {next_id}
+                            WHERE s.query_anno_id = o.id
+                                AND s.query_anno_id >= {current_id} AND s.query_anno_id < {next_id}
                                 {"AND " + pred_where if pred_where else ""}
                         """
                         self.cursor.execute(update_sql)
@@ -741,9 +741,9 @@ class JoinSampler:
                 ids_values = ",".join(f"({uid})" for uid in partition_ids)
                 fetch_sql = f"""
                     WITH partition_filter(pid) AS ( VALUES {ids_values} )
-                    SELECT t.anno_id, t.anno::text
+                    SELECT t.query_anno_id, t.query_anno::text
                     FROM {root_sidecar} t
-                    JOIN partition_filter pf ON t.anno_id = pf.pid
+                    JOIN partition_filter pf ON t.query_anno_id = pf.pid
                 """
                 t1_execute = time.time()
                 self.cursor.execute(fetch_sql)
@@ -848,11 +848,11 @@ class JoinSampler:
                     SELECT
                         {prev_select_str},
                         {next_select_str},
-                        sa.anno::text,
+                        sa.query_anno::text,
                         T_tmp.anno::text
                     FROM {temp_T_name} T_tmp
                     JOIN {real_name} AS {next_alias} ON {fixed_join_cond}
-                    JOIN {next_sidecar} sa ON {next_alias}.id = sa.anno_id;
+                    JOIN {next_sidecar} sa ON {next_alias}.id = sa.query_anno_id;
                 """
                 t5_execute = time.time()
                 self.cursor.execute(fetch_join_sql)
@@ -1045,78 +1045,78 @@ class JoinSampler:
 
         self.create_annotation_tables()
 
-        # if not self.join_templates:
-        #     print("No join templates found. Exiting.")
-        #     return
+        if not self.join_templates:
+            print("No join templates found. Exiting.")
+            return
         
-        # if not os.path.exists(self.output_path):
-        #     os.makedirs(self.output_path)
-        #     print(f"Created output directory: {self.output_path}")
+        if not os.path.exists(self.output_path):
+            os.makedirs(self.output_path)
+            print(f"Created output directory: {self.output_path}")
 
-        # SAVE_BATCH_SIZE = 30
-        # current_batch_samples = {}
-        # processed_count = 0
-        # batch_index = 0
+        SAVE_BATCH_SIZE = 30
+        current_batch_samples = {}
+        processed_count = 0
+        batch_index = 0
 
-        # for template_id, template_data in self.join_templates.items():
-        #     if len(template_data['aliases']) < 2:
-        #         print(f"\n=== Skipping Template: {template_id} (only {len(template_data['aliases'])} table) ===")
-        #         continue
+        for template_id, template_data in self.join_templates.items():
+            if len(template_data['aliases']) < 2:
+                print(f"\n=== Skipping Template: {template_id} (only {len(template_data['aliases'])} table) ===")
+                continue
 
-        #     print(f"\n=== Processing Template: {template_id} ===")
-        #     print(f"    Tables: {template_data['aliases']}")
-        #     print(f"    Total Queries in Group: {template_data['queries_count']}")
+            print(f"\n=== Processing Template: {template_id} ===")
+            print(f"    Tables: {template_data['aliases']}")
+            print(f"    Total Queries in Group: {template_data['queries_count']}")
 
-        #     join_graph = template_data['join_graph']
-        #     aliases = template_data['aliases']
+            join_graph = template_data['join_graph']
+            aliases = template_data['aliases']
 
-        #     try:
-        #         join_order_tree, root_table = self.build_join_tree_structure(join_graph, aliases)
-        #         print(f"    Join Root: {root_table}")
+            try:
+                join_order_tree, root_table = self.build_join_tree_structure(join_graph, aliases)
+                print(f"    Join Root: {root_table}")
 
-        #         # print("    Computing root weights...")
-        #         # root_weights = self.compute_root_weights(root_table, join_order_tree, template_data)
+                # print("    Computing root weights...")
+                # root_weights = self.compute_root_weights(root_table, join_order_tree, template_data)
 
-        #         partitions = self.partition_root_table(root_table=root_table, 
-        #                                                 m_partitions=self.m_partitions, 
-        #                                                 template_data=template_data)
-        #         print(f"    Root table partitioned into {len(partitions)} segments.")
+                partitions = self.partition_root_table(root_table=root_table, 
+                                                        m_partitions=self.m_partitions, 
+                                                        template_data=template_data)
+                print(f"    Root table partitioned into {len(partitions)} segments.")
 
-        #         time_sampling_start = time.time()
+                time_sampling_start = time.time()
 
-        #         template_samples = self.sample_for_one_template(
-        #                 partitions=partitions,
-        #                 root_table=root_table,
-        #                 join_order_tree=join_order_tree,
-        #                 template_data=template_data
-        #             )
+                template_samples = self.sample_for_one_template(
+                        partitions=partitions,
+                        root_table=root_table,
+                        join_order_tree=join_order_tree,
+                        template_data=template_data
+                    )
                 
-        #         current_batch_samples[template_id] = template_samples
-        #         processed_count += 1
+                current_batch_samples[template_id] = template_samples
+                processed_count += 1
 
-        #         print(f"    Sampling completed in {time.time() - time_sampling_start:.2f}s.")
+                print(f"    Sampling completed in {time.time() - time_sampling_start:.2f}s.")
 
-        #         # 批量保存
-        #         if processed_count % SAVE_BATCH_SIZE == 0:
-        #             batch_filename = f"samples_batch_{batch_index}.json"
-        #             batch_full_path = os.path.join(self.output_path, batch_filename)
-        #             self.save_samples(current_batch_samples, batch_full_path)
-        #             print(f"    >>> Saved batch {batch_index} (Templates {processed_count - SAVE_BATCH_SIZE + 1} to {processed_count}), Used Time: {time.time() - start_time:.2f}s")
-        #             batch_index += 1
-        #             current_batch_samples = {}
+                # 批量保存
+                if processed_count % SAVE_BATCH_SIZE == 0:
+                    batch_filename = f"samples_batch_{batch_index}.json"
+                    batch_full_path = os.path.join(self.output_path, batch_filename)
+                    self.save_samples(current_batch_samples, batch_full_path)
+                    print(f"    >>> Saved batch {batch_index} (Templates {processed_count - SAVE_BATCH_SIZE + 1} to {processed_count}), Used Time: {time.time() - start_time:.2f}s")
+                    batch_index += 1
+                    current_batch_samples = {}
 
-        #     except Exception as e:
-        #         print(f"ERROR processing template {template_id}: {e}")
-        #         import traceback
-        #         traceback.print_exc()
+            except Exception as e:
+                print(f"ERROR processing template {template_id}: {e}")
+                import traceback
+                traceback.print_exc()
         
-        # # 保存剩余样本
-        # if current_batch_samples:
-        #     batch_filename = f"samples_batch_{batch_index}.json"
-        #     batch_full_path = os.path.join(self.output_path, batch_filename)
-        #     self.save_samples(current_batch_samples, batch_full_path)
-        #     print(f"    >>> Saved final batch {batch_index} (Templates {processed_count - len(current_batch_samples) + 1} to {processed_count})...")
-        # print(f"\nAll tasks finished. Results saved to directory: {self.output_path}. Total Time: {time.time() - start_time:.2f}s")
+        # 保存剩余样本
+        if current_batch_samples:
+            batch_filename = f"samples_batch_{batch_index}.json"
+            batch_full_path = os.path.join(self.output_path, batch_filename)
+            self.save_samples(current_batch_samples, batch_full_path)
+            print(f"    >>> Saved final batch {batch_index} (Templates {processed_count - len(current_batch_samples) + 1} to {processed_count})...")
+        print(f"\nAll tasks finished. Results saved to directory: {self.output_path}. Total Time: {time.time() - start_time:.2f}s")
 
 
     def save_samples(self, samples_dict, output_path):

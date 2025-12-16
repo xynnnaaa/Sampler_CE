@@ -126,6 +126,7 @@ class TrieNode:
 class JoinPathTrie:
     def __init__(self):
         self.root = TrieNode("ROOT_SENTRY")
+        self.template_freq = {}  # template_id -> query_count
     
     def insert(self, template_id, path_signature):
         node = self.root
@@ -157,6 +158,58 @@ class JoinPathTrie:
                     stack.append(child)
 
         return leaves_count, total_count
+    
+    def _dfs_subtree_stats(self, node):
+        """
+        DFS 统计以 node 为根的子树：
+        - 节点数
+        - template 数
+        - 叶子节点数
+        """
+        node_count = 1
+        template_count = len(node.template_ids)
+        query_count = sum(
+            self.template_freq.get(tid, 0)
+            for tid in node.template_ids
+        )
+        leaf_count = 1 if not node.children else 0
+
+        for child in node.children.values():
+            c_node, c_tpl, c_leaf, c_query = self._dfs_subtree_stats(child)
+            node_count += c_node
+            template_count += c_tpl
+            leaf_count += c_leaf
+            query_count += c_query
+
+        return node_count, template_count, leaf_count, query_count
+
+    def count_root_subtrees(self):
+        """
+        对 root 的每一个子节点，分别统计其子树信息
+        返回 dict:
+        {
+            step_token: {
+                'nodes': int,
+                'templates': int,
+                'leaves': int,
+                'queries': int
+            }
+        }
+        """
+        results = {}
+
+        for step_token, child in self.root.children.items():
+            node_cnt, tpl_cnt, leaf_cnt, query_cnt = self._dfs_subtree_stats(child)
+
+            results[step_token] = {
+                "nodes": node_cnt,
+                "templates": tpl_cnt,
+                "leaves": leaf_cnt,
+                "queries": query_cnt,
+            }
+
+        return results
+
 
 
 class WorkloadAnalyzer:
@@ -165,6 +218,7 @@ class WorkloadAnalyzer:
         self.skip_7a = skip_7a
         self.unique_templates = {} # {signature_string: join_graph}
         self.trie = JoinPathTrie()
+        self.template_query_count = defaultdict(int)
 
     def load_and_group_workload(self):
         """
@@ -205,7 +259,6 @@ class WorkloadAnalyzer:
                 subset_graph = qrep["subset_graph"]
 
                 for subplan_tuple in sorted(subset_graph.nodes()):
-                    # 单表直接跳过
                     if len(subplan_tuple) < 2:
                         continue
 
@@ -226,6 +279,8 @@ class WorkloadAnalyzer:
 
                     if template_key not in temp_groups:
                         temp_groups[template_key] = sub_graph.copy()
+
+                    self.template_query_count[template_key] += 1
 
         print(f"Processed {total_files} query files.")
         print(f"Have {total_subquery_counts} subqueries in total.")
@@ -248,6 +303,7 @@ class WorkloadAnalyzer:
                 continue
 
             template_id = f"T_{idx}" 
+            self.trie.template_freq[template_id] = self.template_query_count[key]
             self.trie.insert(template_id, path_signature)
 
         # 3. 计算结果
@@ -262,6 +318,17 @@ class WorkloadAnalyzer:
         print(f"Minimum Chains Needed  : {leaf_count}")
         print(f"Optimization Ratio     : {100 * (1 - leaf_count / len(self.unique_templates)):.2f}% reduction")
         print("=" * 40)
+
+        subtree_stats = self.trie.count_root_subtrees()
+
+        print("\nPer-root-subtree statistics:")
+        for step, stats in subtree_stats.items():
+            print(f"{step}: "
+                f"nodes={stats['nodes']}, "
+                f"templates={stats['templates']}, "
+                f"leaves={stats['leaves']}, "
+                f"queries={stats['queries']}")
+
 
 
 if __name__ == "__main__":
