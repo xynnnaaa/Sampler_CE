@@ -5,7 +5,6 @@
 import pickle
 import glob
 import os
-import io
 from collections import defaultdict
 from networkx.readwrite import json_graph
 import networkx as nx
@@ -108,16 +107,6 @@ class JoinSampler:
                 user=db_conf.get("user", "your_username")
             )
             self.cursor = self.conn.cursor()
-            self.cursor.execute("""
-                CREATE TEMP TABLE IF NOT EXISTS temp_partition_filter (
-                    pid bigint
-                ) ON COMMIT PRESERVE ROWS;
-            """)
-            self.cursor.execute("""
-                CREATE INDEX IF NOT EXISTS temp_partition_filter_pid_idx
-                ON temp_partition_filter(pid);
-            """)
-
             print("Database connection established.")
         except Exception as e:
             print(f"Error connecting to database: {e}")
@@ -463,47 +452,43 @@ class JoinSampler:
             print(f"Error partitioning root table '{real_name}': {e}")
             raise e
 
-    def create_annotation_tables(self):
+
+    def add_annotation_columns(self):
         """
         [One-Time Setup]
-        不修改原表，而是创建 '{table}_anno_idx' 伴生表存储 PID Bitmap。
-        表结构: (id PRIMARY KEY, anno BIT VARYING)
+        全库初始化：为所有涉及的表添加 'anno' 列，并根据 Global PID Map 填充数据。
+        anno 列存储的是 PID 的 Bitmap
         """
-        print(f"    [Sidecar Setup] Creating annotation tables...")
+        print(f"    [Annotation] Start.")
 
         ROW_BATCH_SIZE = 100000
         UNIQUE_PRED_BATCH_SIZE = 500
 
         start_total = time.time()
+        # for real_name, preds_dict in self.global_predicate_map.items():
         for real_name in self.all_involved_tables:
-            if self.workload_name:
-                sidecar_name = f"{real_name}_anno_idx_{self.workload_name}"
-            else:
-                sidecar_name = f"{real_name}_anno_idx"
-            print(f"        Processing '{real_name}' -> '{sidecar_name}'...", flush=True)
+            print(f"        Adding annotation column to table '{real_name}'...")
             preds_dict = self.global_predicate_map.get(real_name, {})
             total_preds = len(preds_dict)
             if total_preds == 0:
                 total_preds = 1  # 至少要有一位，避免 SQL 错误
             zero_string = '0' * total_preds
+            if self.workload_name:
+                anno_col = "anno" + "_" + self.workload_name
+            else:
+                anno_col = "anno"
 
             try:
-                self.cursor.execute(f"SELECT to_regclass('{sidecar_name}');")
-                if self.cursor.fetchone()[0] is not None:
-                    print(f"        Skipping '{real_name}': Sidecar '{sidecar_name}' already exists.", flush=True)
+                # 先检查，如果列已存在就跳过
+                self.cursor.execute(f"""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = %s AND column_name = %s;
+                """, (real_name, anno_col))
+
+                if self.cursor.fetchone():
+                    print(f"            Column '{anno_col}' already exists in table '{real_name}'. Skipping.")
                     continue
-
-                # self.cursor.execute(f"DROP TABLE IF EXISTS {sidecar_name}")
-                # self.conn.commit()
-
-                create_sql = f"""
-                    CREATE TABLE {sidecar_name} AS
-                    SELECT id AS query_anno_id, B'{zero_string}'::{f"BIT VARYING({total_preds})"} AS query_anno
-                    FROM {real_name}
-                """
-                self.cursor.execute(create_sql)
-                self.cursor.execute(f"ALTER TABLE {sidecar_name} ADD PRIMARY KEY (query_anno_id)")
-                self.conn.commit()
 
                 self.cursor.execute(f"SELECT min(id), max(id) FROM {real_name}")
                 min_id, max_id = self.cursor.fetchone()
@@ -511,6 +496,10 @@ class JoinSampler:
                 if max_id is None: max_id = 0
                 
                 total_row_batches = (max_id - min_id) // ROW_BATCH_SIZE + 1
+
+                self.cursor.execute(f"ALTER TABLE {real_name} DROP COLUMN IF EXISTS {anno_col};")
+                self.cursor.execute(f"ALTER TABLE {real_name} ADD COLUMN {anno_col} BIT VARYING({total_preds}) DEFAULT B'{zero_string}';")
+                self.conn.commit()
 
                 if not preds_dict:
                     print(f"            No predicates for table '{real_name}'. Created anno column with default zeros.")
@@ -548,12 +537,10 @@ class JoinSampler:
 
                     for full_expr, pred_where in sql_chunks:
                         update_sql = f"""
-                            UPDATE {sidecar_name} s
-                            SET query_anno = query_anno | ({full_expr})
-                            FROM {real_name} o
-                            WHERE s.query_anno_id = o.id
-                                AND s.query_anno_id >= {current_id} AND s.query_anno_id < {next_id}
-                                {"AND " + pred_where if pred_where else ""}
+                            UPDATE {real_name}
+                            SET {anno_col} = {anno_col} | ({full_expr})
+                            WHERE id >= {current_id} AND id < {next_id}
+                            {"AND " + pred_where if pred_where else ""}
                         """
                         self.cursor.execute(update_sql)
                     
@@ -567,16 +554,16 @@ class JoinSampler:
                 old_isolation_level = self.conn.isolation_level
                 self.conn.set_isolation_level(0)  # 设置为 autocommit 模式
                 try:
-                    self.cursor.execute(f"VACUUM ANALYZE {sidecar_name};")
+                    self.cursor.execute(f"VACUUM ANALYZE {real_name};")
                 finally:
                     self.conn.set_isolation_level(old_isolation_level)  # 恢复原始隔离级别
 
             except Exception as e:
-                print(f"Error creating annotation table to table '{real_name}': {e}")
+                print(f"Error adding annotation column to table '{real_name}': {e}")
                 self.conn.rollback()
                 raise e
             
-        print(f"    [Sidecar Setup] Finished. Total time: {time.time() - start_total:.2f}s", flush=True)
+        print(f"    [Annotation] Finished. Total time: {time.time() - start_total:.2f}s")
 
 
     def greedy_join_selection(self, partition_ids, partition_idx, root_cache, root_table, join_tree, template_data, global_covered_mask, limit_x):
@@ -596,21 +583,19 @@ class JoinSampler:
             uncovered_mask_int |= (1 << qid)
 
         try:
-            root_real_name = template_data['real_names'][root_table]
             if self.workload_name:
                 temp_T_name = "temp_T_" + self.workload_name
                 temp_T_new_name = "temp_T_new_" + self.workload_name
-                root_sidecar = f"{root_real_name}_anno_idx_{self.workload_name}"
             else:
                 temp_T_name = "temp_T"
                 temp_T_new_name = "temp_T_new"
-                root_sidecar = f"{root_real_name}_anno_idx"
             self.cursor.execute(f"DROP TABLE IF EXISTS {temp_T_name};")
 
             if not partition_ids: return None
 
             current_id_cols = []
 
+            root_real_name = template_data['real_names'][root_table]
             root_sels = join_graph.nodes[root_table]['sels']
 
             root_cols = []
@@ -628,6 +613,10 @@ class JoinSampler:
                 return None
 
             root_select_str = ", ".join(root_cols)
+            if self.workload_name:
+                root_anno_col = "anno" + "_" + self.workload_name
+            else:
+                root_anno_col = "anno"
 
             cached_pairs = None
             if root_cache is not None and partition_idx in root_cache:
@@ -635,29 +624,12 @@ class JoinSampler:
                 cached_pairs = root_cache[partition_idx]
             else:
                 print(f"            Compute id->qid map.")
-
-                self.cursor.execute("TRUNCATE temp_partition_filter")
-                buf = io.StringIO()
-                for pid in partition_ids:
-                    buf.write(f"{pid}\n")
-                buf.seek(0)
-                self.cursor.copy_from(
-                    buf,
-                    "temp_partition_filter",
-                    columns=("pid",),
-                )
-                # ids_values = ",".join(f"({uid})" for uid in partition_ids)
-                # fetch_sql = f"""
-                #     WITH partition_filter(pid) AS ( VALUES {ids_values} )
-                #     SELECT t.query_anno_id, t.query_anno::text
-                #     FROM {root_sidecar} t
-                #     JOIN partition_filter pf ON t.query_anno_id = pf.pid
-                # """
+                ids_values = ",".join(f"({uid})" for uid in partition_ids)
                 fetch_sql = f"""
-                    SELECT t.query_anno_id, t.query_anno::text
-                    FROM {root_sidecar} t
-                    JOIN temp_partition_filter pf
-                    ON t.query_anno_id = pf.pid;
+                    WITH partition_filter(pid) AS ( VALUES {ids_values} )
+                    SELECT {root_table}.id, {root_anno_col}::text
+                    FROM {root_real_name} AS {root_table}
+                    JOIN partition_filter pf ON {root_table}.id = pf.pid
                 """
                 t1_execute = time.time()
                 self.cursor.execute(fetch_sql)
@@ -734,11 +706,6 @@ class JoinSampler:
             for step in join_tree[1:]:
                 next_alias = step['alias']
                 real_name = step['real_name']
-                if self.workload_name:
-                    next_sidecar = f"{real_name}_anno_idx_{self.workload_name}"
-                else:
-                    next_sidecar = f"{real_name}_anno_idx"
-
                 parent_alias = step['parent']
                 raw_join_cond = step['join_condition'] # e.g., "t.id = mi.movie_id"
 
@@ -762,23 +729,18 @@ class JoinSampler:
                     SELECT
                         {prev_select_str},
                         {next_select_str},
-                        sa.query_anno::text,
+                        {next_alias}.anno::text,
                         T_tmp.anno::text
                     FROM {temp_T_name} T_tmp
-                    JOIN {real_name} AS {next_alias} ON {fixed_join_cond}
-                    JOIN {next_sidecar} sa ON {next_alias}.id = sa.query_anno_id;
+                    JOIN {real_name} AS {next_alias}
+                    ON {fixed_join_cond};
                 """
                 t5_execute = time.time()
-                self.cursor.execute("SET enable_hashjoin = OFF;")
-                self.cursor.execute("SET enable_mergejoin = OFF;")
                 self.cursor.execute(fetch_join_sql)
                 print(f"                Execute {next_alias} join select query in {time.time() - t5_execute:.2f}s.")
                 t5_fetchall = time.time()
                 rows = self.cursor.fetchall()
                 print(f"                Fetched joined rows with '{next_alias}' in {time.time() - t5_fetchall:.2f}s. Total rows: {len(rows)}")
-
-                self.cursor.execute("SET enable_hashjoin = ON;")
-                self.cursor.execute("SET enable_mergejoin = ON;")
 
                 scored_candidates = []
                 n_map = pid_map.get(next_alias, {})
@@ -852,6 +814,39 @@ class JoinSampler:
                 t8 = time.time()
                 execute_values(self.cursor, insert_sql, insert_values)
                 print(f"            Inserted top-{len(top_k)} candidates into '{temp_T_name}' after joining '{next_alias}' in {time.time() - t8:.2f}s.")
+
+            # # check，一定选出的是top_k中的第一个吗？
+            # self.cursor.execute(f"SELECT * FROM {temp_T_name} LIMIT 1;")
+            # row = self.cursor.fetchone()
+
+            # if row is None:
+            #     return None
+            
+            # # 提取所有id列，把“_id”结尾的列都当成 id 列
+            # # check 这个列名提取方式对吗？
+            # full_row_ids = {}
+            # col_names = [desc[0] for desc in self.cursor.description]
+            # anno_bits = row[-1] # 最后一列是 anno
+
+            # for i, col_name in enumerate(col_names[:-1]):
+            #     if col_name.endswith("_id") or col_name.endswith("_Id"):
+            #         for alias in join_graph.nodes:
+            #             if col_name == f"{alias}_id" or col_name == f"{alias}_Id":
+            #                 full_row_ids[alias] = row[i]
+            #                 break
+
+            # # check
+            # covered_indices = set()
+            # if anno_bits:
+            #     for idx, bit in enumerate(anno_bits):
+            #         if bit == '1':
+            #             qid = total_queries - 1 - idx
+            #             covered_indices.add(qid)
+            
+            # return {
+            #     'full_row': full_row_ids,
+            #     'covered_indices': covered_indices
+            # }
         
         except Exception as e:
             self.conn.rollback()
@@ -960,7 +955,7 @@ class JoinSampler:
 
         print(f"Total Join Templates Loaded: {len(self.join_templates)}, Workload Parsing Time: {time.time() - start_time:.2f}s")
 
-        self.create_annotation_tables()
+        self.add_annotation_columns()  # 一次性为所有表添加 anno 列
 
         if not self.join_templates:
             print("No join templates found. Exiting.")
@@ -970,7 +965,7 @@ class JoinSampler:
             os.makedirs(self.output_path)
             print(f"Created output directory: {self.output_path}")
 
-        SAVE_BATCH_SIZE = 10
+        SAVE_BATCH_SIZE = 30
         current_batch_samples = {}
         processed_count = 0
         batch_index = 0
