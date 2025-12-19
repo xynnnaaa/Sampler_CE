@@ -63,10 +63,9 @@ def get_deterministic_execution_plan(join_graph, aliases):
 
     def root_score(alias):
         real_name = join_graph.nodes[alias]['real_name']
-        return (-TABLE_CARD.get(real_name, float("inf")), alias)
+        return (TABLE_CARD.get(real_name, float("inf")), alias)
 
     root_table = max(aliases, key=root_score)
-
 
     visited = {root_table}
 
@@ -91,27 +90,6 @@ def get_deterministic_execution_plan(join_graph, aliases):
         norm_cond = normalize_condition(raw_condition)
 
         path_signature.append((parent, child, norm_cond))
-
-        # current_node = queue.pop(0)
-        
-        # neighbors = list(join_graph.neighbors(current_node))
-        # neighbors.sort()
-
-        # for neighbor in neighbors:
-        #     if neighbor not in visited:
-        #         visited.add(neighbor)
-        #         queue.append(neighbor)
-
-        #         edge_data = join_graph.get_edge_data(current_node, neighbor)
-        #         raw_condition = edge_data.get("join_condition")
-
-        #         if not raw_condition:
-        #             raise ValueError(f"Missing join condition between {current_node} and {neighbor}")
-
-        #         norm_cond = normalize_condition(raw_condition)
-
-        #         # 存的是 (parent, child, cond)，构成了 Trie 的一条边
-        #         path_signature.append((current_node, neighbor, norm_cond))
     
     return path_signature
 
