@@ -15,6 +15,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 import sys
 import re
+import heapq
 
 import sqlglot
 from sqlglot import exp
@@ -790,6 +791,7 @@ class JoinSampler:
                 # TODO: 这里内存占用很大，可以不要append了，改成维护一个limit_x大小的有序数组？
 
                 t6 = time.time()
+                top_k_heap = []
                 for row in rows:
                     t_qid_str = row[-1]
                     n_pid_str = row[-2]
@@ -797,9 +799,14 @@ class JoinSampler:
                     n_qid_mask = self._translate_pid_bitmap(n_pid_str, n_map, n_global)
                     new_anno_mask = n_qid_mask & int(t_qid_str, 2)
                     score = bin(new_anno_mask & uncovered_mask_int).count('1')
-                    scored_candidates.append((score, row_data, new_anno_mask))
-                scored_candidates.sort(key=lambda x: x[0], reverse=True)
-                top_k = scored_candidates[:limit_x]
+                    item = (score, row_data, new_anno_mask)
+                    if len(top_k_heap) < limit_x:
+                        heapq.heappush(top_k_heap, item)
+                    else:
+                        if score > top_k_heap[0][0]:
+                            heapq.heapreplace(top_k_heap, item)
+
+                top_k = sorted(top_k_heap, key=lambda x: x[0], reverse=True)
                 print(f"            Processed and scored joined rows in {time.time() - t6:.2f}s.")
 
                 if not top_k:
