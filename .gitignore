@@ -4,3 +4,4 @@
 imdb_base_only.dump
 *.sh
 *.sql
+.DS_Store
