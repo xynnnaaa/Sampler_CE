@@ -356,11 +356,11 @@ class JoinSampler:
         pass
 
 
-    # TODO: root不要选基数太大的表
+    # root选最大的表，后面的表按基数升序排列
     def build_join_tree_structure(self, join_graph, aliases):
         def root_score(alias):
             real_name = join_graph.nodes[alias]['real_name']
-            return (-TABLE_CARD.get(real_name, float("inf")), alias)
+            return (TABLE_CARD.get(real_name, float("inf")), alias)
 
         root_table = max(aliases, key=root_score)
 
