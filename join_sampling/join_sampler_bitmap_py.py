@@ -428,7 +428,7 @@ class JoinSampler:
         return join_execution_plan, root_table
 
 
-    # 划分可以先改成对第一个表平均划分，先随机分吧
+    # 划分可以先改成对第一个表平均划分，随机分吧
     def partition_root_table(self, root_table, m_partitions, template_data):
         """
         将root划分为 m 个分区，返回每个分区的 id 列表。
@@ -441,21 +441,24 @@ class JoinSampler:
 
             total_rows = len(all_ids)
 
-            # 行数少于分区数时，调整分区数，每个分区一个 ID
+            # 行数少于分区数时，允许重复选id
             if total_rows < m_partitions:
-                m_partitions = total_rows
+                for i in range(m_partitions):
+                    pid = all_ids[i % total_rows]
+                    partitions.append([pid])
 
-            base_size = total_rows // m_partitions
-            remainder = total_rows % m_partitions
+            if total_rows > m_partitions:
+                base_size = total_rows // m_partitions
+                remainder = total_rows % m_partitions
 
-            partitions = []
-            start_idx = 0
-            for i in range(m_partitions):
-                part_size = base_size + (1 if i < remainder else 0)
-                end_idx = start_idx + part_size
-                partition_ids = all_ids[start_idx:end_idx]
-                partitions.append(partition_ids)
-                start_idx = end_idx
+                partitions = []
+                start_idx = 0
+                for i in range(m_partitions):
+                    part_size = base_size + (1 if i < remainder else 0)
+                    end_idx = start_idx + part_size
+                    partition_ids = all_ids[start_idx:end_idx]
+                    partitions.append(partition_ids)
+                    start_idx = end_idx
 
             return partitions
 
@@ -783,6 +786,8 @@ class JoinSampler:
                 scored_candidates = []
                 n_map = pid_map.get(next_alias, {})
                 n_global = global_map.get(next_alias, 0)
+
+                # TODO: 这里内存占用很大，可以不要append了，改成维护一个limit_x大小的有序数组？
 
                 t6 = time.time()
                 for row in rows:

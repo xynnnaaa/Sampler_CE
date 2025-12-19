@@ -1,3 +1,6 @@
 # ignore log files
 *.log
 *.json
+imdb_base_only.dump
+*.sh
+*.sql
