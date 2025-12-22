@@ -71,9 +71,11 @@ class TrieNode:
         self.is_template_end = False
         self.pending_instances = [] # 暂存
         self.end_template_keys = [] 
+        self.join_graph = None
 
         # QID Info
         self.relevant_qids = set()
+        self.current_qids = set()   # 在这个点结束的所有template对应所有查询的集合
         self.qid_map = {}   # {qid: {alias: pid}}
         self.subtree_total_queries = 0 # 只有 Root 节点这个值有意义
 
@@ -116,6 +118,7 @@ class JoinPathTrie:
         node.is_template_end = True
         node.pending_instances.extend(instances)
         node.end_template_keys.append(template_key)
+        node.join_graph = join_graph.copy()
 
 
 class JoinSampler:
@@ -157,6 +160,8 @@ class JoinSampler:
         self.join_templates = {}
         self.global_predicate_map = defaultdict(lambda: {}) # {real_table: {pred_sql: pid}}
         self.global_pid_counters = defaultdict(int)         # {real_table: next_pid}
+
+        self.final_samples = {}
 
         db_conf = self.config.get("database", {})
         try:
@@ -362,6 +367,8 @@ class JoinSampler:
 
                 my_relevant = set()
 
+                my_query = set()
+
                 if node.is_template_end:
                     for inst in node.pending_instances:
                         qid = current_qid_counter
@@ -369,6 +376,7 @@ class JoinSampler:
 
                         node.qid_map[qid] = inst
                         my_relevant.add(qid)
+                        my_query.add(qid)
                     node.pending_instances = [] 
 
                 for child in node.children.values():
@@ -376,6 +384,7 @@ class JoinSampler:
                     my_relevant.update(child_relevant)
 
                 node.relevant_qids = my_relevant
+                node.current_qids = my_query
                 return my_relevant
             
             assign_and_aggregate(root_node)
@@ -587,16 +596,6 @@ class JoinSampler:
         
         return result_mask
     
-    def sample_subtree_recursive(self, current_node, partition_ids, global_covered, pid_map, global_map):
-        """
-        DFS 遍历 Trie 进行采样。
-        利用 TrieNode.current_temp_table 传递中间结果。
-        """
-
-        tmp_table_name = f"temp_{id(current_node)}_{int(time.time()*100000)}"
-
-        parent_temp_table = getattr(current_node, 'parent_temp_table_ref', None)
-
 
     def sample_trie_root(self, root_node):
         """
@@ -605,7 +604,7 @@ class JoinSampler:
 
         # 对root进行分区
         real_name = root_node.real_name
-        partitions = self.partition_root_table_simple(real_name, self.m_partitions)
+        partitions = self.partition_root_table(real_name, self.m_partitions)
 
         # 构建子树级 pid--qid 映射
         pid_map, global_map = self.prepare_subtree_pid_map(root_node)
@@ -617,6 +616,8 @@ class JoinSampler:
 
         for k in range(self.k_bitmaps):
             print(f"    --> Bitmap {k+1}/{self.k_bitmaps}...", flush=True)
+
+            current_bitmap_samples = defaultdict(list)
 
             for p_idx, partition_ids in enumerate(partitions):
                 root_temp_table = f"temp_root_{id(root_node)}_{p_idx}"
@@ -633,12 +634,21 @@ class JoinSampler:
 
                 if success:
                     try:
+                        # 收集当前分区的样本
+                        # 结构: { template_key: sample_dict }
+                        partition_results = {}
+                        partition_newly_covered = set()
+
                         if root_node.is_template_end:
-                            self.collect_samples_for_node(root_node, root_temp_table, subtree_covered)
+                            sample, covered = self.collect_samples_for_node(root_node, root_temp_table, subtree_covered)
+                            if sample:
+                                partition_newly_covered.update(covered)
+                                for key in root_node.end_template_keys:
+                                    partition_results[key] = sample
 
                         # DFS
                         for child in root_node.children.values():
-                            self.dfs_join_recursive(
+                            child_results, child_covered = self.dfs_join_recursive(
                                 current_node=child,
                                 parent_table=root_temp_table,
                                 pid_map=pid_map,
@@ -646,16 +656,39 @@ class JoinSampler:
                                 covered_mask=subtree_covered,
                                 total_queries=total_qids
                             )
+                            partition_results.update(child_results)
+                            partition_newly_covered.update(child_covered)
+
+                        subtree_covered.update(partition_newly_covered)
+                        for key, sample in partition_results.items():
+                            current_bitmap_samples[key].append(sample)
+
                     finally:
                         self.cursor.execute(f"DROP TABLE IF EXISTS {root_temp_table}")
 
                 self.conn.commit()
+
+            for tmpl_key, samples_list in current_bitmap_samples.items():
+                aliases_tuple = tmpl_key[0]
+                sig = tmpl_key[1]
+                import hashlib
+                sig_hash = hashlib.md5(sig.encode('utf-8')).hexdigest()[:6]
+                template_id = f"{'_'.join(aliases_tuple)}_{sig_hash}"
+
+                if template_id not in self.final_samples:
+                    self.final_samples[template_id] = []
+                
+                self.final_samples[template_id].append(samples_list)
 
     def dfs_join_recursive(self, current_node, parent_table, pid_map, global_map, covered_mask, total_queries):
         """
         DFS 递归 Join。
         """
         current_temp_table = f"temp_{id(current_node)}_{int(time.time()*1000)}"
+
+        collected_results = defaultdict(list)
+        all_newly_covered = set()
+        
         
         # --- Join Sampling---
         success = self.execute_join_step(
@@ -674,11 +707,16 @@ class JoinSampler:
         try:
             # 收集样本
             if current_node.is_template_end:
-                self.collect_samples_for_node(current_node, current_temp_table, covered_mask)
+                sample_dict, newly_covered  = self.collect_samples_for_node(current_node, current_temp_table, covered_mask)
+
+                if sample_dict:
+                    all_newly_covered.update(newly_covered)
+                    for tmpl_key in current_node.end_template_keys:
+                        collected_results[tmpl_key] = sample_dict
             
             # 递归子节点
             for child in current_node.children.values():
-                self.dfs_join_recursive(
+                child_results, child_covered = self.dfs_join_recursive(
                     current_node=child,
                     parent_table=current_temp_table,
                     pid_map=pid_map,
@@ -686,6 +724,11 @@ class JoinSampler:
                     covered_mask=covered_mask,
                     total_queries=total_queries
                 )
+
+                collected_results.update(child_results)
+                all_newly_covered.update(child_covered)
+
+            return collected_results, all_newly_covered
                 
         finally:
             self.cursor.execute(f"DROP TABLE IF EXISTS {current_temp_table}")
@@ -804,6 +847,201 @@ class JoinSampler:
             print(f"Error in execute_root_step for {node.child_alias}: {e}")
             self.conn.rollback()
             return False
+        
+    def execute_join_step(self, node, input_table, output_table, pid_map, global_map, covered_mask, total_queries):
+        try:
+            # Uncovered Mask = (Relevant - Covered)
+            target_qids = node.relevant_qids - covered_mask
+            target_mask_int = 0
+            for qid in target_qids:
+                target_mask_int |= (1 << qid)
+                
+            real_name = node.real_name
+            alias = node.child_alias
+            sidecar_name = f"{real_name}_anno_idx"
+            if self.workload_name:
+                sidecar_name += f"_{self.workload_name}"
+
+            r_map = pid_map.get(alias, {})
+            r_global = global_map.get(alias, 0)
+
+            parent_alias = node.parent_alias
+            raw_join_cond = node.join_condition
+
+            self.cursor.execute(f"SELECT * FROM {input_table} LIMIT 0")
+            prev_cols = [desc[0] for desc in self.cursor.description if desc[0] != 'anno']
+            prev_select_str = ", ".join([f"T_tmp.{col}" for col in prev_cols])
+
+            next_cols = []
+            for sel in node.sels:
+                col_pure = sel.split('.')[-1]
+                next_cols.append(f"{alias}.{col_pure} AS {alias}_{col_pure}")
+            next_select_str = ", ".join(next_cols)
+
+            pattern = fr"\b{parent_alias}\."
+            replacement = f"T_tmp.{parent_alias}_"
+            fixed_join_cond = re.sub(pattern, replacement, raw_join_cond)
+
+            fetch_join_sql = f"""
+                SELECT
+                    {prev_select_str},
+                    {next_select_str},
+                    sa.query_anno::text,
+                    T_tmp.anno::text
+                FROM {input_table} T_tmp
+                JOIN {real_name} AS {alias} ON {fixed_join_cond}
+                JOIN {sidecar_name} sa ON {alias}.id = sa.query_anno_id;
+            """
+
+            self.cursor.execute("SET enable_hashjoin = OFF;")
+            self.cursor.execute("SET enable_mergejoin = OFF;")
+            self.cursor.execute(fetch_join_sql)
+            rows = self.cursor.fetchall()
+            self.cursor.execute("SET enable_hashjoin = ON;")
+            self.cursor.execute("SET enable_mergejoin = ON;")
+
+            top_k_heap = []
+            for row in rows:
+                t_qid_str = row[-1]
+                n_pid_str = row[-2]
+                row_data = row[:-2] # 合并后的 ID 列表
+                
+                n_qid_mask = self._translate_pid_bitmap(n_pid_str, r_map, r_global)
+                new_anno_mask = n_qid_mask & int(t_qid_str, 2)
+                
+                score = bin(new_anno_mask & target_mask_int).count('1')
+                
+                item = (score, row_data, new_anno_mask)
+                if len(top_k_heap) < self.limit_x:
+                    heapq.heappush(top_k_heap, item)
+                else:
+                    if score > top_k_heap[0][0]:
+                        heapq.heapreplace(top_k_heap, item)
+            
+            top_k = sorted(top_k_heap, key=lambda x: x[0], reverse=True)
+            if not top_k: return False
+
+            dummy_anno = f"B'{'0'*total_queries}'::bit varying({total_queries})"
+
+            create_sql = f"""
+                CREATE TEMP TABLE {output_table} AS
+                SELECT
+                    {prev_select_str},
+                    {next_select_str},
+                    {dummy_anno} AS anno
+                FROM {input_table} T_tmp
+                JOIN {real_name} AS {alias} ON {fixed_join_cond}
+                LIMIT 0
+            """
+            self.cursor.execute(create_sql)
+
+            insert_values = []
+            for _, row_data, anno_mask in top_k:
+                anno_str = format(anno_mask, f'0{total_queries}b')
+                insert_values.append(tuple(list(row_data) + [anno_str]))
+            
+            insert_sql = f"INSERT INTO {output_table} VALUES %s"
+            execute_values(self.cursor, insert_sql, insert_values)
+            
+            return True
+        
+        except Exception as e:
+            print(f"Error in execute_join_step for node {node.child_alias}: {e}")
+            self.conn.rollback()
+            return False
+        
+    def collect_samples_for_node(self, node, temp_table, covered_mask):
+        """
+        从临时表中提取 Top-1 样本，保存到对应的 Template，并更新覆盖率。
+        """
+
+        # CHECK：要考虑covered_mask
+        try:
+            join_graph = node.join_graph.copy()
+
+            self.cursor.execute(f"SELECT * FROM {temp_table} LIMIT 1")
+            row = self.cursor.fetchone()
+            
+            if not row:
+                return
+
+            col_names = [desc[0] for desc in self.cursor.description]
+            anno_bits = row[-1]
+            row_data = row[:-1]
+            
+            # 解析 ID 字典: {alias: id}
+            sample_dict = {}
+            
+            for i, col_name in enumerate(col_names[:-1]):
+                if col_name.endswith("_id") or col_name.endswith("_Id"):
+                    for alias in join_graph.nodes:
+                        if col_name == f"{alias}_id" or col_name == f"{alias}_Id":
+                            sample_dict[alias] = row_data[i]
+                            break
+
+            # 3. 更新覆盖率，只更新当前node对应template对应的所有查询
+            # 解析 anno_bits (QID)
+            newly_covered = set()
+            if anno_bits:
+                total_len = len(anno_bits)
+                for idx, bit in enumerate(anno_bits):
+                    if bit == '1':
+                        qid = total_len - 1 - idx
+                        if qid in node.current_qid:
+                            newly_covered.add(qid)
+
+            return sample_dict, newly_covered
+
+        except Exception as e:
+            print(f"Error collecting samples: {e}")
+            return None, set()
+        
+        
+    def save_samples(self, samples_dict, output_path):
+        """
+        保存采样结果+格式转换
+        List[List[Dict{'alias': id}]] -> List[List[List[Header, Row1, Row2...]]]
+        Header 按别名字典序排列 (e.g., ["mi.id", "t.id"])
+        """
+
+        formatted_output = {}
+
+        for template_id, k_bitmaps in samples_dict.items():
+            formatted_bitmaps = []
+
+            for bitmap in k_bitmaps:
+                if not bitmap:
+                    formatted_bitmaps.append([])
+                    continue
+
+                aliases = sorted(bitmap[0].keys())
+                header = [f"{alias}.id" for alias in aliases]
+                formatted_rows = [header]
+
+                for row_dict in bitmap:
+                    row = [row_dict[alias] for alias in aliases]
+                    formatted_rows.append(row)
+                
+                formatted_bitmaps.append(formatted_rows)
+            
+            formatted_output[template_id] = formatted_bitmaps
+
+        # 序列化保存
+        def default_serializer(obj):
+            import decimal
+            import datetime
+            if isinstance(obj, (datetime.date, datetime.datetime)):
+                return obj.isoformat()
+            if isinstance(obj, decimal.Decimal):
+                return float(obj)
+            return str(obj)
+        
+        try:
+            with open(output_path, 'w') as f:
+                json.dump(formatted_output, f, default=default_serializer, indent=2)
+        except Exception as e:
+            print(f"Error saving samples to {output_path}: {e}")
+            raise e
 
 
     def sample(self):
