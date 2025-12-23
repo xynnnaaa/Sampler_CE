@@ -196,11 +196,28 @@ class JoinSampler:
 
 
     def get_deterministic_execution_plan(self, join_graph, aliases):
-        def root_score(alias):
-            real_name = join_graph.nodes[alias]['real_name']
-            return (-TABLE_CARD.get(real_name, float("inf")), alias)
+        # def root_score(alias):
+        #     real_name = join_graph.nodes[alias]['real_name']
+        #     return (-TABLE_CARD.get(real_name, float("inf")), alias)
 
-        root_table = max(aliases, key=root_score)
+        # root_table = max(aliases, key=root_score)
+
+        scored = []
+        for a in aliases:
+            real_name = join_graph.nodes[a]['real_name']
+            card = TABLE_CARD.get(real_name, float("inf"))
+            scored.append((card, a))
+        scored.sort()
+
+        root_table = None
+
+        for card, alias in scored:
+            if card > 100000:
+                root_table = alias
+                break
+
+        if root_table is None:
+            root_table = scored[0][1]
 
         visited = {root_table}
 

@@ -73,7 +73,16 @@ def get_deterministic_execution_plan(join_graph, aliases):
         card = TABLE_CARD.get(real_name, float("inf"))
         scored.append((card, a))
     scored.sort()
-    root_table =  scored[len(scored) // 2][1]
+
+    root_table = None
+
+    for card, alias in scored:
+        if card > 100000:
+            root_table = alias
+            break
+
+    if root_table is None:
+        root_table = scored[0][1]
 
     visited = {root_table}
 
