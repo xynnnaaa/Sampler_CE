@@ -444,6 +444,7 @@ class JoinSampler:
 
             # 行数少于分区数时，允许重复选id
             if total_rows < m_partitions:
+                partitions = []
                 for i in range(m_partitions):
                     pid = all_ids[i % total_rows]
                     partitions.append([pid])
