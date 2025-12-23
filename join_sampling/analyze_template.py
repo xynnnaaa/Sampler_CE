@@ -198,7 +198,7 @@ class WorkloadAnalyzer:
         self.trie = JoinPathTrie()
         self.template_query_count = defaultdict(int)
 
-    def load_and_group_workload(self):
+    def load_and_group_workload_ceb(self):
         """
         遍历文件，提取唯一的 Join Template 结构。
         这里去掉了谓词处理，只保留图结构的分组。
@@ -259,6 +259,62 @@ class WorkloadAnalyzer:
                         temp_groups[template_key] = sub_graph.copy()
 
                     self.template_query_count[template_key] += 1
+
+        print(f"Processed {total_files} query files.")
+        print(f"Have {total_subquery_counts} subqueries in total.")
+        print(f"Found {len(temp_groups)} distinct unique join templates (ignoring predicates).")
+        
+        self.unique_templates = temp_groups
+
+    
+    def load_and_group_workload_job(self):
+        """
+        遍历文件，提取唯一的 Join Template 结构。
+        这里去掉了谓词处理，只保留图结构的分组。
+        """
+        print(f"Loading workload from: {self.base_query_dir}")
+        temp_groups = {} # Key: (aliases_tuple, join_sig_str), Value: subgraph
+
+        total_files = 0
+
+        total_subquery_counts = 0
+
+        pkl_files = sorted(glob.glob(os.path.join(self.base_query_dir, "*.pkl")))
+        
+        for pkl_file in pkl_files:
+            try:
+                qrep = load_qrep(pkl_file)
+                total_files += 1
+            except Exception as e:
+                print(f"Error loading {pkl_file}: {e}")
+                continue
+
+            join_graph = qrep["join_graph"]
+            subset_graph = qrep["subset_graph"]
+
+            for subplan_tuple in sorted(subset_graph.nodes()):
+                if len(subplan_tuple) < 2:
+                    continue
+
+                total_subquery_counts += 1
+
+                sorted_aliases = sorted(list(subplan_tuple))
+                sub_graph = join_graph.subgraph(subplan_tuple)
+                
+                edges_info = []
+                for u, v, data in sub_graph.edges(data=True):
+                    if u > v: u, v = v, u
+                    cond = normalize_condition(data.get("join_condition", ""))
+                    edges_info.append(f"{u}|{v}|{cond}")
+                
+                edges_info.sort()
+                join_sig_str = "||".join(edges_info)
+                template_key = (tuple(sorted_aliases), join_sig_str)
+
+                if template_key not in temp_groups:
+                    temp_groups[template_key] = sub_graph.copy()
+
+                self.template_query_count[template_key] += 1
 
         print(f"Processed {total_files} query files.")
         print(f"Have {total_subquery_counts} subqueries in total.")
@@ -409,23 +465,24 @@ class WorkloadAnalyzer:
 
 if __name__ == "__main__":
     # BASE_DIR = "/data1/xuyining/CEB/my_queries_all/half_ceb_full"
-    BASE_DIR = "/data1/xuyining/CEB-default/queries/ceb-imdb"
+    # BASE_DIR = "/data1/xuyining/CEB-default/queries/ceb-imdb"
+    BASE_DIR = "/data1/xuyining/Sampler/mscn/queries/joblight_train/joblight-train-all"
     
     analyzer = WorkloadAnalyzer(BASE_DIR, skip_7a=True)
 
-    # t1 = time.time()
+    t1 = time.time()
     
-    # analyzer.load_and_group_workload()
+    analyzer.load_and_group_workload_job()
 
-    # print(f"Load and parse workload in {time.time() - t1:.2f}s.")
+    print(f"Load and parse workload in {time.time() - t1:.2f}s.")
 
-    # t2 = time.time()
+    t2 = time.time()
 
-    # if analyzer.unique_templates:
-    #     analyzer.build_trie_and_count()
-    # else:
-    #     print("No templates found to analyze.")
+    if analyzer.unique_templates:
+        analyzer.build_trie_and_count()
+    else:
+        print("No templates found to analyze.")
 
-    # print(f"Build trie and count leaves in {time.time() - t2:.2f}s.")
+    print(f"Build trie and count leaves in {time.time() - t2:.2f}s.")
 
-    analyzer.analyze_all_templates()
+    # analyzer.analyze_all_templates()

@@ -350,6 +350,30 @@ class JoinSampler:
             join_graph = data['graph']
             instances = data['instances'] # List[Dict{alias: pid}]
 
+            for node, info in join_graph.nodes(data=True):
+                sels = []
+                edges = join_graph.edges(node)
+                for edge in edges:
+                    # edge_data = join_graph.get_edge_data(edge[0], edge[1])
+                    edge_data = join_graph[edge[0]][edge[1]]
+                    if "!" in edge_data["join_condition"]:
+                        jconds = edge_data["join_condition"].split("!=")
+                    else:
+                        jconds = edge_data["join_condition"].split("=")
+                    for jc in jconds:
+                        jc = jc.strip()
+                        if node == jc[0:len(node)]:
+                            if jc not in sels:
+                                sels.append(jc)
+                        jc_node = jc.split(".")[0]
+                        join_graph[edge[0]][edge[1]][jc_node] = jc
+                
+                # 如果没有主键就加上主键
+                if f"{node}.id" not in sels and f"{node}.Id" not in sels:
+                    sels.append(f"{node}.id")
+                
+                join_graph.nodes()[node]["sels"] = sels
+
             try:
                 path_signature = self.get_deterministic_execution_plan(join_graph, list(aliases_tuple))
                 self.trie.insert(template_key, path_signature, join_graph, instances)
@@ -622,6 +646,10 @@ class JoinSampler:
         for k in range(self.k_bitmaps):
             print(f"    --> Bitmap {k+1}/{self.k_bitmaps}...", flush=True)
 
+            if len(subtree_covered) == total_qids:
+                print("        All queries covered. Stop sampling.")
+                break
+
             bitmap_start_time = time.time()
 
             current_bitmap_samples = defaultdict(list)
@@ -629,9 +657,16 @@ class JoinSampler:
             for p_idx, partition_ids in enumerate(partitions):
                 print(f"            Sampling for partition {p_idx+1}...")
 
+                # 收集当前分区的样本
+                # 结构: { template_key: sample_dict }
+                partition_results = {}
+                partition_newly_covered = set()
+
                 t_partition_start = time.time()
 
                 root_temp_table = f"temp_root_{id(root_node)}_{p_idx}"
+
+                self.cursor.execute(f"DROP TABLE IF EXISTS {root_temp_table}")
 
                 t_root_start = time.time()
 
@@ -645,15 +680,10 @@ class JoinSampler:
                     total_queries=total_qids
                 )
 
-                print(f"                Execute root step finish in {time.time() - t_root_start:.2f}s in total, time_fetch = {t_fetch}, time_compute = {t_compute}")
+                print(f"                Execute root step finish in {time.time() - t_root_start:.2f}s in total, time_fetch = {t_fetch:.2f}, time_compute = {t_compute:.2f}")
 
                 if success:
                     try:
-                        # 收集当前分区的样本
-                        # 结构: { template_key: sample_dict }
-                        partition_results = {}
-                        partition_newly_covered = set()
-
                         t_root_collect_start = time.time()
 
                         if root_node.is_template_end:
@@ -681,15 +711,13 @@ class JoinSampler:
                         for key, sample in partition_results.items():
                             current_bitmap_samples[key].append(sample)
 
-                        
-
                     finally:
                         self.cursor.execute(f"DROP TABLE IF EXISTS {root_temp_table}")
 
                 self.conn.commit()
 
-                coverage_pct = (len(partition_newly_covered) / total_qids * 100) if total_qids > 0 else 0
-                print(f"            Partition {p_idx+1} finished, total time:{time.time() - t_partition_start:.2f}s. Covers {len(partition_newly_covered)} new queries.Global Coverage: {coverage_pct:.2f}%.")
+                coverage_pct = (len(subtree_covered) / total_qids * 100) if total_qids > 0 else 0
+                print(f"            Partition {p_idx+1} finished, total time:{time.time() - t_partition_start:.2f}s. Covers {len(partition_newly_covered)} new queries. Current Global Coverage: {coverage_pct:.2f}%.")
         
             print(f"        Bitmap {k+1} finished, total time:{time.time() - bitmap_start_time:.2f}s.")
 
@@ -705,27 +733,26 @@ class JoinSampler:
         collected_results = defaultdict(list)
         all_newly_covered = set()
         
-        
-        # --- Join Sampling---
-        t_total_start = time.time()
-
-        success, t_join, t_compute = self.execute_join_step(
-            node=current_node,
-            input_table=parent_table,
-            output_table=current_temp_table,
-            pid_map=pid_map,
-            global_map=global_map,
-            covered_mask=covered_mask,
-            total_queries=total_queries
-        )
-
-        print(f"                Execute join step finish in {time.time() - t_total_start:.2f}s in total, time_join = {t_join}, time_compute = {t_compute}")
-        
-        # check
-        if not success:
-            return collected_results, all_newly_covered
-
         try:
+            # --- Join Sampling---
+            t_total_start = time.time()
+
+            success, t_join, t_compute = self.execute_join_step(
+                node=current_node,
+                input_table=parent_table,
+                output_table=current_temp_table,
+                pid_map=pid_map,
+                global_map=global_map,
+                covered_mask=covered_mask,
+                total_queries=total_queries
+            )
+
+            print(f"                Execute join step finish in {time.time() - t_total_start:.2f}s in total, time_join = {t_join:.2f}, time_compute = {t_compute:.2f}. success = {success}")
+            
+            # check
+            if not success:
+                return collected_results, all_newly_covered
+
             # 收集样本
             if current_node.is_template_end:
                 sample_dict, newly_covered  = self.collect_samples_for_node(current_node, current_temp_table, covered_mask)
@@ -774,7 +801,7 @@ class JoinSampler:
             if self.workload_name:
                 sidecar_name += f"_{self.workload_name}"
             
-            ids_values = ",".join(f"({uid})" for uid in partition_ids)
+            # ids_values = ",".join(f"({uid})" for uid in partition_ids)
 
             current_id_cols = []
 
@@ -798,15 +825,33 @@ class JoinSampler:
             r_map = pid_map.get(alias, {})
             r_global = global_map.get(alias, 0)
 
+            self.cursor.execute("TRUNCATE temp_partition_filter")
+            buf = io.StringIO()
+            for pid in partition_ids:
+                buf.write(f"{pid}\n")
+            buf.seek(0)
+            self.cursor.copy_from(
+                buf,
+                "temp_partition_filter",
+                columns=("pid",),
+            )
+            # fetch_sql = f"""
+            #     WITH partition_filter(pid) AS ( VALUES {ids_values} )
+            #     SELECT t.query_anno_id, t.query_anno::text
+            #     FROM {sidecar_name} t
+            #     JOIN partition_filter pf ON t.query_anno_id = pf.pid
+            # """
+
+            fetch_sql = f"""
+                SELECT t.query_anno_id, t.query_anno::text
+                FROM {sidecar_name} t
+                JOIN temp_partition_filter pf
+                ON t.query_anno_id = pf.pid;
+            """
+
             t_fetch_start = time.time()
 
             # --- 2. Fetch---
-            fetch_sql = f"""
-                WITH partition_filter(pid) AS ( VALUES {ids_values} )
-                SELECT t.query_anno_id, t.query_anno::text
-                FROM {sidecar_name} t
-                JOIN partition_filter pf ON t.query_anno_id = pf.pid
-            """
             self.cursor.execute(fetch_sql)
             rows = self.cursor.fetchall()
 
@@ -931,6 +976,8 @@ class JoinSampler:
             self.cursor.execute("SET enable_hashjoin = ON;")
             self.cursor.execute("SET enable_mergejoin = ON;")
 
+            print(f"                    Fetched joined rows with '{alias}' on {fixed_join_cond}. Total rows: {len(rows)}")
+
             t_join = time.time() - t_join_start
 
             t_compute_start = time.time()
@@ -960,6 +1007,8 @@ class JoinSampler:
             if not top_k: return False, t_join, t_compute
 
             dummy_anno = f"B'{'0'*total_queries}'::bit varying({total_queries})"
+
+            self.cursor.execute(f"DROP TABLE IF EXISTS {output_table}")
 
             create_sql = f"""
                 CREATE TEMP TABLE {output_table} AS
@@ -1029,7 +1078,7 @@ class JoinSampler:
                 for idx, bit in enumerate(anno_bits):
                     if bit == '1':
                         qid = total_len - 1 - idx
-                        if qid in node.current_qid and qid not in covered_mask:
+                        if qid in node.current_qids and qid not in covered_mask:
                             newly_covered.add(qid)
 
             return sample_dict, newly_covered
@@ -1117,5 +1166,22 @@ class JoinSampler:
 
         # 遍历 Trie 的每个 Root 子树
         for root_token, root_node in self.trie.root.children.items():
+            # TODO: 这里跳过了ci表
+            if root_node.child_alias == "ci":
+                print("=== Skip root ci===")
+                continue
             print(f"\n=== Processing Root Subtree: {root_node.child_alias} ({root_node.real_name}) ===", flush=True)
             self.sample_trie_root(root_node)
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python join_sampler.py <config_path>")
+        sys.exit(1)
+    
+    config_path = sys.argv[1]
+
+    sampler = JoinSampler(config_path)
+    try:
+        sampler.sample()
+    finally:
+        sampler.close()
