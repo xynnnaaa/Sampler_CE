@@ -198,7 +198,7 @@ class JoinSampler:
     def get_deterministic_execution_plan(self, join_graph, aliases):
         def root_score(alias):
             real_name = join_graph.nodes[alias]['real_name']
-            return (TABLE_CARD.get(real_name, float("inf")), alias)
+            return (-TABLE_CARD.get(real_name, float("inf")), alias)
 
         root_table = max(aliases, key=root_score)
 
@@ -643,6 +643,9 @@ class JoinSampler:
         total_qids = root_node.subtree_total_queries
         print(f"    total queries: {total_qids}")
 
+        # 缓存root的anno列翻译结果
+        root_partition_cache = {}
+
         for k in range(self.k_bitmaps):
             print(f"    --> Bitmap {k+1}/{self.k_bitmaps}...", flush=True)
 
@@ -677,7 +680,9 @@ class JoinSampler:
                     pid_map=pid_map,
                     global_map=global_map,
                     covered_mask=subtree_covered,
-                    total_queries=total_qids
+                    total_queries=total_qids,
+                    root_cache=root_partition_cache,
+                    partition_idx = p_idx
                 )
 
                 print(f"                Execute root step finish in {time.time() - t_root_start:.2f}s in total, time_fetch = {t_fetch:.2f}, time_compute = {t_compute:.2f}")
@@ -781,7 +786,7 @@ class JoinSampler:
         finally:
             self.cursor.execute(f"DROP TABLE IF EXISTS {current_temp_table}")
 
-    def execute_root_step(self, node, partition_ids, output_table, pid_map, global_map, covered_mask, total_queries):
+    def execute_root_step(self, node, partition_ids, output_table, pid_map, global_map, covered_mask, total_queries, root_cache, partition_idx):
         """
         [Root Processing]
         1. Fetch: 从 Root Sidecar 表读取 (id, pid_bitmap)。
@@ -821,50 +826,67 @@ class JoinSampler:
                 return False, 0, 0
 
             root_select_str = ", ".join(root_cols)
+
+            cached_pairs = None
+            if root_cache is not None and partition_idx in root_cache:
+                print(f"                    Load id->qid map from cache.")
+                cached_pairs = root_cache[partition_idx]
+                t_compute_start = time.time()
+                t_fetch = 0
+            else:
+                print(f"                    Compute id->qid map.")
             
-            r_map = pid_map.get(alias, {})
-            r_global = global_map.get(alias, 0)
+                r_map = pid_map.get(alias, {})
+                r_global = global_map.get(alias, 0)
 
-            self.cursor.execute("TRUNCATE temp_partition_filter")
-            buf = io.StringIO()
-            for pid in partition_ids:
-                buf.write(f"{pid}\n")
-            buf.seek(0)
-            self.cursor.copy_from(
-                buf,
-                "temp_partition_filter",
-                columns=("pid",),
-            )
-            # fetch_sql = f"""
-            #     WITH partition_filter(pid) AS ( VALUES {ids_values} )
-            #     SELECT t.query_anno_id, t.query_anno::text
-            #     FROM {sidecar_name} t
-            #     JOIN partition_filter pf ON t.query_anno_id = pf.pid
-            # """
+                self.cursor.execute("TRUNCATE temp_partition_filter")
+                buf = io.StringIO()
+                for pid in partition_ids:
+                    buf.write(f"{pid}\n")
+                buf.seek(0)
+                self.cursor.copy_from(
+                    buf,
+                    "temp_partition_filter",
+                    columns=("pid",),
+                )
+                # fetch_sql = f"""
+                #     WITH partition_filter(pid) AS ( VALUES {ids_values} )
+                #     SELECT t.query_anno_id, t.query_anno::text
+                #     FROM {sidecar_name} t
+                #     JOIN partition_filter pf ON t.query_anno_id = pf.pid
+                # """
 
-            fetch_sql = f"""
-                SELECT t.query_anno_id, t.query_anno::text
-                FROM {sidecar_name} t
-                JOIN temp_partition_filter pf
-                ON t.query_anno_id = pf.pid;
-            """
+                fetch_sql = f"""
+                    SELECT t.query_anno_id, t.query_anno::text
+                    FROM {sidecar_name} t
+                    JOIN temp_partition_filter pf
+                    ON t.query_anno_id = pf.pid;
+                """
 
-            t_fetch_start = time.time()
+                t_fetch_start = time.time()
 
-            # --- 2. Fetch---
-            self.cursor.execute(fetch_sql)
-            rows = self.cursor.fetchall()
+                # --- 2. Fetch---
+                self.cursor.execute(fetch_sql)
+                rows = self.cursor.fetchall()
 
-            t_fetch = time.time() - t_fetch_start
+                t_fetch = time.time() - t_fetch_start
 
-            t_compute_start = time.time()
-            
-            # --- 3. Python Compute ---
+                cached_pairs = []
+
+                t_compute_start = time.time()
+                
+                # --- 3. Python Compute ---
+                for row in rows:
+                    pk_id = row[0]
+                    pid_str = row[1]
+                    qid_mask = self._translate_pid_bitmap(pid_str, r_map, r_global)
+                    cached_pairs.append((pk_id, qid_mask))
+
+                if root_cache is not None:
+                    root_cache[partition_idx] = cached_pairs
+
             top_k_heap = []
-            for row in rows:
-                pk_id = row[0]
-                pid_str = row[1]
-                qid_mask = self._translate_pid_bitmap(pid_str, r_map, r_global)
+            for pk_id, qid_mask in cached_pairs:
                 score = bin(qid_mask & target_mask_int).count('1')
                 item = (score, pk_id, qid_mask)
                 if len(top_k_heap) < self.limit_x:
@@ -872,7 +894,7 @@ class JoinSampler:
                 else:
                     if score > top_k_heap[0][0]:
                         heapq.heapreplace(top_k_heap, item)
-            
+
             # --- 4. Sort & Prune ---
             top_k = sorted(top_k_heap, key=lambda x: x[0], reverse=True)
 
@@ -1166,10 +1188,6 @@ class JoinSampler:
 
         # 遍历 Trie 的每个 Root 子树
         for root_token, root_node in self.trie.root.children.items():
-            # TODO: 这里跳过了ci表
-            if root_node.child_alias == "ci":
-                print("=== Skip root ci===")
-                continue
             print(f"\n=== Processing Root Subtree: {root_node.child_alias} ({root_node.real_name}) ===", flush=True)
             self.sample_trie_root(root_node)
 

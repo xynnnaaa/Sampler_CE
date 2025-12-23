@@ -61,11 +61,19 @@ def get_deterministic_execution_plan(join_graph, aliases):
     返回一个由 (parent, child, condition) 组成的签名列表。
     """
 
-    def root_score(alias):
-        real_name = join_graph.nodes[alias]['real_name']
-        return (TABLE_CARD.get(real_name, float("inf")), alias)
+    # def root_score(alias):
+    #     real_name = join_graph.nodes[alias]['real_name']
+    #     return (-TABLE_CARD.get(real_name, float("inf")), alias)
 
-    root_table = max(aliases, key=root_score)
+    # root_table = max(aliases, key=root_score)
+
+    scored = []
+    for a in aliases:
+        real_name = join_graph.nodes[a]['real_name']
+        card = TABLE_CARD.get(real_name, float("inf"))
+        scored.append((card, a))
+    scored.sort()
+    root_table =  scored[len(scored) // 2][1]
 
     visited = {root_table}
 
@@ -465,14 +473,14 @@ class WorkloadAnalyzer:
 
 if __name__ == "__main__":
     # BASE_DIR = "/data1/xuyining/CEB/my_queries_all/half_ceb_full"
-    # BASE_DIR = "/data1/xuyining/CEB-default/queries/ceb-imdb"
-    BASE_DIR = "/data1/xuyining/Sampler/mscn/queries/joblight_train/joblight-train-all"
+    BASE_DIR = "/data1/xuyining/CEB-default/queries/ceb-imdb"
+    # BASE_DIR = "/data1/xuyining/Sampler/mscn/queries/joblight_train/joblight-train-all"
     
     analyzer = WorkloadAnalyzer(BASE_DIR, skip_7a=True)
 
     t1 = time.time()
     
-    analyzer.load_and_group_workload_job()
+    analyzer.load_and_group_workload_ceb()
 
     print(f"Load and parse workload in {time.time() - t1:.2f}s.")
 
