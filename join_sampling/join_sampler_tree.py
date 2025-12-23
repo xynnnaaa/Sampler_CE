@@ -64,14 +64,15 @@ TABLE_CARD = {
 
 class TrieNode:
     def __init__(self, token):
+        # 当前节点的表统一用child标记
+
         self.token = token # (parent, child, condition)
         self.children = {} # Dict[StepToken, TrieNode]
 
         # Template Info
         self.is_template_end = False
         self.pending_instances = [] # 暂存
-        self.end_template_keys = [] 
-        self.join_graph = None
+        self.end_template_keys = []
 
         # QID Info
         self.relevant_qids = set()
@@ -79,7 +80,7 @@ class TrieNode:
         self.qid_map = {}   # {qid: {alias: pid}}
         self.subtree_total_queries = 0 # 只有 Root 节点这个值有意义
 
-        # Graph Info
+        # Graph Info，每一个节点都会在insert时设置
         self.child_alias = None
         self.real_name = None
         self.join_condition = None
@@ -107,7 +108,6 @@ class JoinPathTrie:
 
                 if child in join_graph.nodes:
                     new_node.real_name = join_graph.nodes[child]['real_name']
-
                     new_node.sels = join_graph.nodes[child].get('sels', [])
 
                 node.children[step_token] = new_node
@@ -115,10 +115,11 @@ class JoinPathTrie:
             node = node.children[step_token]
 
         # 填充 Template Info 部分
+
         node.is_template_end = True
         node.pending_instances.extend(instances)
         node.end_template_keys.append(template_key)
-        node.join_graph = join_graph.copy()
+
 
 
 class JoinSampler:
@@ -160,8 +161,6 @@ class JoinSampler:
         self.join_templates = {}
         self.global_predicate_map = defaultdict(lambda: {}) # {real_table: {pred_sql: pid}}
         self.global_pid_counters = defaultdict(int)         # {real_table: next_pid}
-
-        self.final_samples = {}
 
         db_conf = self.config.get("database", {})
         try:
@@ -226,11 +225,11 @@ class JoinSampler:
             raw_condition = edge_data.get("join_condition")
             norm_cond = normalize_condition(raw_condition)
 
+            if not norm_cond:
+                raise ValueError(f"Missing join condition between {parent} and {child}")
+
             path_signature.append((parent, child, norm_cond))
 
-            if not raw_condition:
-                raise ValueError(f"Missing join condition between {parent} and {child}")
-        
         if len(path_signature) != len(aliases):
             print(f"WARNING: Subgraph might be disconnected. Expected {len(aliases)} nodes, got {len(path_signature)}.")
 
@@ -238,6 +237,8 @@ class JoinSampler:
     
 
     def load_and_parse_workload(self):
+        # 和线性逻辑完全一致，信息存储到 self.temp_template_data
+
         self.all_involved_tables = set()
 
         self.temp_template_data = defaultdict(lambda: {'instances': [], 'graph': None})
@@ -395,6 +396,7 @@ class JoinSampler:
 
 
     def create_annotation_tables(self):
+        # 和线性结构完全一致
         """
         [One-Time Setup]
         不修改原表，而是创建 '{table}_anno_idx' 伴生表存储 PID Bitmap。
@@ -604,25 +606,36 @@ class JoinSampler:
 
         # 对root进行分区
         real_name = root_node.real_name
+        t1 = time.time()
         partitions = self.partition_root_table(real_name, self.m_partitions)
+        print(f"    Root partitioned into {len(partitions)} segments in {time.time() - t1:.2f}s")
 
+        t2 = time.time()
         # 构建子树级 pid--qid 映射
         pid_map, global_map = self.prepare_subtree_pid_map(root_node)
-
-        print(f"    Root partitioned into {len(partitions)} segments.", flush=True)
+        print(f"    build pid-qid map in {time.time() - t2:.2f}s")
 
         subtree_covered = set()
         total_qids = root_node.subtree_total_queries
+        print(f"    total queries: {total_qids}")
 
         for k in range(self.k_bitmaps):
             print(f"    --> Bitmap {k+1}/{self.k_bitmaps}...", flush=True)
 
+            bitmap_start_time = time.time()
+
             current_bitmap_samples = defaultdict(list)
 
             for p_idx, partition_ids in enumerate(partitions):
+                print(f"            Sampling for partition {p_idx+1}...")
+
+                t_partition_start = time.time()
+
                 root_temp_table = f"temp_root_{id(root_node)}_{p_idx}"
 
-                success = self.execute_root_step(
+                t_root_start = time.time()
+
+                success, t_fetch, t_compute = self.execute_root_step(
                     node=root_node,
                     partition_ids=partition_ids,
                     output_table=root_temp_table,
@@ -632,6 +645,8 @@ class JoinSampler:
                     total_queries=total_qids
                 )
 
+                print(f"                Execute root step finish in {time.time() - t_root_start:.2f}s in total, time_fetch = {t_fetch}, time_compute = {t_compute}")
+
                 if success:
                     try:
                         # 收集当前分区的样本
@@ -639,12 +654,15 @@ class JoinSampler:
                         partition_results = {}
                         partition_newly_covered = set()
 
+                        t_root_collect_start = time.time()
+
                         if root_node.is_template_end:
                             sample, covered = self.collect_samples_for_node(root_node, root_temp_table, subtree_covered)
                             if sample:
                                 partition_newly_covered.update(covered)
                                 for key in root_node.end_template_keys:
                                     partition_results[key] = sample
+                            print(f"                Collect root result in {time.time() - t_root_collect_start:.2f}s.")
 
                         # DFS
                         for child in root_node.children.values():
@@ -663,22 +681,20 @@ class JoinSampler:
                         for key, sample in partition_results.items():
                             current_bitmap_samples[key].append(sample)
 
+                        
+
                     finally:
                         self.cursor.execute(f"DROP TABLE IF EXISTS {root_temp_table}")
 
                 self.conn.commit()
 
-            for tmpl_key, samples_list in current_bitmap_samples.items():
-                aliases_tuple = tmpl_key[0]
-                sig = tmpl_key[1]
-                import hashlib
-                sig_hash = hashlib.md5(sig.encode('utf-8')).hexdigest()[:6]
-                template_id = f"{'_'.join(aliases_tuple)}_{sig_hash}"
+                coverage_pct = (len(partition_newly_covered) / total_qids * 100) if total_qids > 0 else 0
+                print(f"            Partition {p_idx+1} finished, total time:{time.time() - t_partition_start:.2f}s. Covers {len(partition_newly_covered)} new queries.Global Coverage: {coverage_pct:.2f}%.")
+        
+            print(f"        Bitmap {k+1} finished, total time:{time.time() - bitmap_start_time:.2f}s.")
 
-                if template_id not in self.final_samples:
-                    self.final_samples[template_id] = []
-                
-                self.final_samples[template_id].append(samples_list)
+            if current_bitmap_samples:
+                self.save_single_bitmap(k+1, root_node.child_alias, current_bitmap_samples)
 
     def dfs_join_recursive(self, current_node, parent_table, pid_map, global_map, covered_mask, total_queries):
         """
@@ -691,7 +707,9 @@ class JoinSampler:
         
         
         # --- Join Sampling---
-        success = self.execute_join_step(
+        t_total_start = time.time()
+
+        success, t_join, t_compute = self.execute_join_step(
             node=current_node,
             input_table=parent_table,
             output_table=current_temp_table,
@@ -700,9 +718,12 @@ class JoinSampler:
             covered_mask=covered_mask,
             total_queries=total_queries
         )
+
+        print(f"                Execute join step finish in {time.time() - t_total_start:.2f}s in total, time_join = {t_join}, time_compute = {t_compute}")
         
+        # check
         if not success:
-            return
+            return collected_results, all_newly_covered
 
         try:
             # 收集样本
@@ -770,12 +791,14 @@ class JoinSampler:
 
             if id_idx == -1:
                 print(f"        Warning: can't find id column for table {alias}.")
-                return None
+                return False, 0, 0
 
             root_select_str = ", ".join(root_cols)
             
             r_map = pid_map.get(alias, {})
             r_global = global_map.get(alias, 0)
+
+            t_fetch_start = time.time()
 
             # --- 2. Fetch---
             fetch_sql = f"""
@@ -786,6 +809,10 @@ class JoinSampler:
             """
             self.cursor.execute(fetch_sql)
             rows = self.cursor.fetchall()
+
+            t_fetch = time.time() - t_fetch_start
+
+            t_compute_start = time.time()
             
             # --- 3. Python Compute ---
             top_k_heap = []
@@ -803,9 +830,11 @@ class JoinSampler:
             
             # --- 4. Sort & Prune ---
             top_k = sorted(top_k_heap, key=lambda x: x[0], reverse=True)
+
+            t_compute = time.time() - t_compute_start
             
             if not top_k:
-                return False
+                return False, t_fetch, t_compute
             
             top_ids = [item[1] for item in top_k]
             top_ids_str = ",".join(map(str, top_ids))
@@ -841,12 +870,12 @@ class JoinSampler:
             insert_sql = f"INSERT INTO {output_table} VALUES %s"
             execute_values(self.cursor, insert_sql, insert_values)
 
-            return True
+            return True, t_fetch, t_compute
 
         except Exception as e:
             print(f"Error in execute_root_step for {node.child_alias}: {e}")
             self.conn.rollback()
-            return False
+            return False, t_fetch, t_compute
         
     def execute_join_step(self, node, input_table, output_table, pid_map, global_map, covered_mask, total_queries):
         try:
@@ -882,6 +911,8 @@ class JoinSampler:
             replacement = f"T_tmp.{parent_alias}_"
             fixed_join_cond = re.sub(pattern, replacement, raw_join_cond)
 
+            t_join_start = time.time()
+
             fetch_join_sql = f"""
                 SELECT
                     {prev_select_str},
@@ -899,6 +930,10 @@ class JoinSampler:
             rows = self.cursor.fetchall()
             self.cursor.execute("SET enable_hashjoin = ON;")
             self.cursor.execute("SET enable_mergejoin = ON;")
+
+            t_join = time.time() - t_join_start
+
+            t_compute_start = time.time()
 
             top_k_heap = []
             for row in rows:
@@ -919,7 +954,10 @@ class JoinSampler:
                         heapq.heapreplace(top_k_heap, item)
             
             top_k = sorted(top_k_heap, key=lambda x: x[0], reverse=True)
-            if not top_k: return False
+
+            t_compute = time.time() - t_compute_start
+
+            if not top_k: return False, t_join, t_compute
 
             dummy_anno = f"B'{'0'*total_queries}'::bit varying({total_queries})"
 
@@ -943,12 +981,12 @@ class JoinSampler:
             insert_sql = f"INSERT INTO {output_table} VALUES %s"
             execute_values(self.cursor, insert_sql, insert_values)
             
-            return True
+            return True, t_join, t_compute
         
         except Exception as e:
             print(f"Error in execute_join_step for node {node.child_alias}: {e}")
             self.conn.rollback()
-            return False
+            return False, t_join, t_compute
         
     def collect_samples_for_node(self, node, temp_table, covered_mask):
         """
@@ -957,13 +995,13 @@ class JoinSampler:
 
         # CHECK：要考虑covered_mask
         try:
-            join_graph = node.join_graph.copy()
+            sorted_aliases = node.end_template_keys[0][0]
 
             self.cursor.execute(f"SELECT * FROM {temp_table} LIMIT 1")
             row = self.cursor.fetchone()
             
             if not row:
-                return
+                return None, set()
 
             col_names = [desc[0] for desc in self.cursor.description]
             anno_bits = row[-1]
@@ -974,10 +1012,14 @@ class JoinSampler:
             
             for i, col_name in enumerate(col_names[:-1]):
                 if col_name.endswith("_id") or col_name.endswith("_Id"):
-                    for alias in join_graph.nodes:
+                    for alias in sorted_aliases:
                         if col_name == f"{alias}_id" or col_name == f"{alias}_Id":
                             sample_dict[alias] = row_data[i]
                             break
+            
+            for alias in sorted_aliases:
+                if alias not in sample_dict:
+                    print(f"            Warning: ID for alias '{alias}' not found in selected row.")
 
             # 3. 更新覆盖率，只更新当前node对应template对应的所有查询
             # 解析 anno_bits (QID)
@@ -987,7 +1029,7 @@ class JoinSampler:
                 for idx, bit in enumerate(anno_bits):
                     if bit == '1':
                         qid = total_len - 1 - idx
-                        if qid in node.current_qid:
+                        if qid in node.current_qid and qid not in covered_mask:
                             newly_covered.add(qid)
 
             return sample_dict, newly_covered
@@ -996,37 +1038,47 @@ class JoinSampler:
             print(f"Error collecting samples: {e}")
             return None, set()
         
+
+    def save_single_bitmap(self, k, root_alias, current_bitmap_samples):
+        """
+        保存当前 Root 子树在第 k 轮生成的样本。
+        文件名: {output_path}/{root_alias}_bitmap_{k}.json
+        内容结构: { template_id: [ [sample_dict...] ] } (保持结构一致性，虽然只有一层)
+        或者简化为: { template_id: [sample_dict...] } (更直观)
+        """
+        # 确保目录存在
+        if not os.path.exists(self.output_path):
+            os.makedirs(self.output_path)
+
+        filename = f"{root_alias}_bitmap_{k}.json"
+        full_path = os.path.join(self.output_path, filename)
         
-    def save_samples(self, samples_dict, output_path):
-        """
-        保存采样结果+格式转换
-        List[List[Dict{'alias': id}]] -> List[List[List[Header, Row1, Row2...]]]
-        Header 按别名字典序排列 (e.g., ["mi.id", "t.id"])
-        """
-
         formatted_output = {}
-
-        for template_id, k_bitmaps in samples_dict.items():
-            formatted_bitmaps = []
-
-            for bitmap in k_bitmaps:
-                if not bitmap:
-                    formatted_bitmaps.append([])
-                    continue
-
-                aliases = sorted(bitmap[0].keys())
-                header = [f"{alias}.id" for alias in aliases]
-                formatted_rows = [header]
-
-                for row_dict in bitmap:
-                    row = [row_dict[alias] for alias in aliases]
-                    formatted_rows.append(row)
-                
-                formatted_bitmaps.append(formatted_rows)
+        
+        for tmpl_key, samples_list in current_bitmap_samples.items():
+            # 生成 Template ID
+            aliases_tuple = tmpl_key[0]
+            sig = tmpl_key[1]
+            import hashlib
+            sig_hash = hashlib.md5(sig.encode('utf-8')).hexdigest()[:6]
+            template_id = f"{'_'.join(aliases_tuple)}_{sig_hash}"
             
-            formatted_output[template_id] = formatted_bitmaps
+            # 格式化: 转换为 [Header, Rows...]
+            if not samples_list:
+                formatted_output[template_id] = []
+                continue
+                
+            aliases = sorted(samples_list[0].keys())
+            header = [f"{alias}.id" for alias in aliases]
+            formatted_rows = [header]
+            
+            for row_dict in samples_list:
+                row = [row_dict[alias] for alias in aliases]
+                formatted_rows.append(row)
+            
+            formatted_output[template_id] = formatted_rows
 
-        # 序列化保存
+        # 序列化
         def default_serializer(obj):
             import decimal
             import datetime
@@ -1037,11 +1089,11 @@ class JoinSampler:
             return str(obj)
         
         try:
-            with open(output_path, 'w') as f:
+            with open(full_path, 'w') as f:
                 json.dump(formatted_output, f, default=default_serializer, indent=2)
+            print(f"    Saved bitmap {k+1} to {filename}", flush=True)
         except Exception as e:
-            print(f"Error saving samples to {output_path}: {e}")
-            raise e
+            print(f"Error saving bitmap: {e}", flush=True)
 
 
     def sample(self):
