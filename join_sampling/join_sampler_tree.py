@@ -691,7 +691,7 @@ class JoinSampler:
 
                 t_root_start = time.time()
 
-                success, t_fetch, t_compute = self.execute_root_step(
+                success, t_fetch_compute = self.execute_root_step(
                     node=root_node,
                     partition_ids=partition_ids,
                     output_table=root_temp_table,
@@ -703,7 +703,7 @@ class JoinSampler:
                     partition_idx = p_idx
                 )
 
-                print(f"                Execute root step finish in {time.time() - t_root_start:.2f}s in total, time_fetch = {t_fetch:.2f}, time_compute = {t_compute:.2f}")
+                print(f"                Execute root step finish in {time.time() - t_root_start:.2f}s in total, time_fetch_compute = {t_fetch_compute:.2f}")
 
                 if success:
                     try:
@@ -824,7 +824,6 @@ class JoinSampler:
             if self.workload_name:
                 sidecar_name += f"_{self.workload_name}"
             
-            # ids_values = ",".join(f"({uid})" for uid in partition_ids)
 
             current_id_cols = []
 
@@ -849,8 +848,7 @@ class JoinSampler:
             if root_cache is not None and partition_idx in root_cache:
                 print(f"                    Load id->qid map from cache.")
                 cached_pairs = root_cache[partition_idx]
-                t_compute_start = time.time()
-                t_fetch = 0
+                t_fetch_compute = 0
             else:
                 print(f"                    Compute id->qid map.")
             
@@ -867,12 +865,8 @@ class JoinSampler:
                     "temp_partition_filter",
                     columns=("pid",),
                 )
-                # fetch_sql = f"""
-                #     WITH partition_filter(pid) AS ( VALUES {ids_values} )
-                #     SELECT t.query_anno_id, t.query_anno::text
-                #     FROM {sidecar_name} t
-                #     JOIN partition_filter pf ON t.query_anno_id = pf.pid
-                # """
+
+                self.cursor.execute("ANALYZE temp_partition_filter")
 
                 fetch_sql = f"""
                     SELECT t.query_anno_id, t.query_anno::text
@@ -880,25 +874,32 @@ class JoinSampler:
                     JOIN temp_partition_filter pf
                     ON t.query_anno_id = pf.pid;
                 """
-
-                t_fetch_start = time.time()
-
+                
                 # --- 2. Fetch---
-                self.cursor.execute(fetch_sql)
-                rows = self.cursor.fetchall()
-
-                t_fetch = time.time() - t_fetch_start
-
                 cached_pairs = []
 
-                t_compute_start = time.time()
-                
-                # --- 3. Python Compute ---
-                for row in rows:
-                    pk_id = row[0]
-                    pid_str = row[1]
-                    qid_mask = self._translate_pid_bitmap(pid_str, r_map, r_global)
-                    cached_pairs.append((pk_id, qid_mask))
+                t_fetch_compute_start = time.time()
+
+                batch_size = 5000
+
+                cursor_name = f"cursor_root_{int(time.time()*1000)}"
+                with self.conn.cursor(name=cursor_name) as fetch_cursor:
+                    fetch_cursor.itersize = batch_size
+                    fetch_cursor.execute(fetch_sql)
+
+                    while True:
+                        rows = fetch_cursor.fetchmany(batch_size)
+                        if not rows:
+                            break
+
+                        # --- Python compute in batch ---
+                        for pk_id, pid_str in rows:
+                            qid_mask = self._translate_pid_bitmap(
+                                pid_str, r_map, r_global
+                            )
+                            cached_pairs.append((pk_id, qid_mask))
+
+                t_fetch_compute = time.time() - t_fetch_compute_start
 
                 if root_cache is not None:
                     root_cache[partition_idx] = cached_pairs
@@ -915,11 +916,9 @@ class JoinSampler:
 
             # --- 4. Sort & Prune ---
             top_k = sorted(top_k_heap, key=lambda x: x[0], reverse=True)
-
-            t_compute = time.time() - t_compute_start
             
             if not top_k:
-                return False, t_fetch, t_compute
+                return False, t_fetch_compute
             
             top_ids = [item[1] for item in top_k]
             top_ids_str = ",".join(map(str, top_ids))
@@ -955,12 +954,12 @@ class JoinSampler:
             insert_sql = f"INSERT INTO {output_table} VALUES %s"
             execute_values(self.cursor, insert_sql, insert_values)
 
-            return True, t_fetch, t_compute
+            return True, t_fetch_compute
 
         except Exception as e:
             print(f"Error in execute_root_step for {node.child_alias}: {e}")
             self.conn.rollback()
-            return False, t_fetch, t_compute
+            return False, t_fetch_compute
         
     def execute_join_step(self, node, input_table, output_table, pid_map, global_map, covered_mask, total_queries):
         try:
@@ -1204,10 +1203,14 @@ class JoinSampler:
             os.makedirs(self.output_path)
             print(f"Created output directory: {self.output_path}")
 
+        parallel = 0
+
         # 遍历 Trie 的每个 Root 子树
         for root_token, root_node in self.trie.root.children.items():
-            print(f"\n=== Processing Root Subtree: {root_node.child_alias} ({root_node.real_name}) ===", flush=True)
-            self.sample_trie_root(root_node)
+            parallel += 1
+            if parallel > 7:
+                print(f"\n=== Processing Root Subtree: {root_node.child_alias} ({root_node.real_name}) ===", flush=True)
+                self.sample_trie_root(root_node)
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
