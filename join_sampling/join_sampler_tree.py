@@ -108,18 +108,25 @@ class JoinPathTrie:
 
                 if child in join_graph.nodes:
                     new_node.real_name = join_graph.nodes[child]['real_name']
-                    new_node.sels = join_graph.nodes[child].get('sels', [])
+                    # new_node.sels = join_graph.nodes[child].get('sels', [])
 
                 node.children[step_token] = new_node
             
             node = node.children[step_token]
+
+            # 修复：合并sels信息
+            child_alias = node.child_alias
+            if child_alias in join_graph.nodes:
+                sels = join_graph.nodes[child_alias].get('sels', [])
+                for sel in sels:
+                    if sel not in node.sels:
+                        node.sels.append(sel)
 
         # 填充 Template Info 部分
 
         node.is_template_end = True
         node.pending_instances.extend(instances)
         node.end_template_keys.append(template_key)
-
 
 
 class JoinSampler:
@@ -772,7 +779,7 @@ class JoinSampler:
 
             print(f"                Execute join step finish in {time.time() - t_total_start:.2f}s in total, time_join = {t_join:.2f}, time_compute = {t_compute:.2f}. success = {success}")
             
-            # check
+            # success == False 表示这一步join没有得到连接结果，返回空的结果，并且不继续递归
             if not success:
                 return collected_results, all_newly_covered
 
@@ -880,7 +887,7 @@ class JoinSampler:
 
                 t_fetch_compute_start = time.time()
 
-                batch_size = 5000
+                batch_size = 1000
 
                 cursor_name = f"cursor_root_{int(time.time()*1000)}"
                 with self.conn.cursor(name=cursor_name) as fetch_cursor:
@@ -1081,7 +1088,6 @@ class JoinSampler:
         从临时表中提取 Top-1 样本，保存到对应的 Template，并更新覆盖率。
         """
 
-        # CHECK：要考虑covered_mask
         try:
             sorted_aliases = node.end_template_keys[0][0]
 
@@ -1179,7 +1185,7 @@ class JoinSampler:
         try:
             with open(full_path, 'w') as f:
                 json.dump(formatted_output, f, default=default_serializer, indent=2)
-            print(f"    Saved bitmap {k+1} to {filename}", flush=True)
+            print(f"    Saved bitmap {k} to {filename}", flush=True)
         except Exception as e:
             print(f"Error saving bitmap: {e}", flush=True)
 
@@ -1208,7 +1214,7 @@ class JoinSampler:
         # 遍历 Trie 的每个 Root 子树
         for root_token, root_node in self.trie.root.children.items():
             parallel += 1
-            if parallel > 7:
+            if parallel > 8:
                 print(f"\n=== Processing Root Subtree: {root_node.child_alias} ({root_node.real_name}) ===", flush=True)
                 self.sample_trie_root(root_node)
 
