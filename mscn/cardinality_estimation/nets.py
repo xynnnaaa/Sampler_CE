@@ -53,7 +53,8 @@ class SetConv(nn.Module):
             hid_units,
             other_hid_units,
             num_hidden_layers=2, n_out=1,
-            dropouts=[0.0, 0.0, 0.0], use_sigmoid=True):
+            dropouts=[0.0, 0.0, 0.0], use_sigmoid=True,
+            join_emb_dim=0):
         super(SetConv, self).__init__()
 
         ## debug time code
@@ -71,6 +72,8 @@ class SetConv(nn.Module):
         self.flow_feats = flow_feats
         self.num_hidden_layers = num_hidden_layers
         num_layer1_blocks = 0
+
+        self.join_emb_dim = join_emb_dim
 
         self.inp_drop = dropouts[0]
         self.hl_drop = dropouts[1]
@@ -106,6 +109,8 @@ class SetConv(nn.Module):
                 combined_hid_units = hid_units
             else:
                 combined_hid_units = other_hid_units
+
+        combined_size += self.join_emb_dim
 
 
         if self.sample_feats != 0:
@@ -153,6 +158,8 @@ class SetConv(nn.Module):
         predicates = xbatch["pred"]
         joins = xbatch["join"]
         flows = xbatch["flow"]
+
+        join_sample_embs = xbatch.get("join_embedding", None)
 
         sample_mask = xbatch["tmask"]
         predicate_mask = xbatch["pmask"]
@@ -235,6 +242,11 @@ class SetConv(nn.Module):
                 hid_join = hid_join.squeeze()
 
             tocat.append(hid_join)
+
+        if join_sample_embs is not None and self.join_emb_dim > 0:
+            join_embs = join_sample_embs.to(device, non_blocking=True)
+            join_embs = self.inp_drop_layer(join_embs)
+            tocat.append(join_embs)
 
         if DEBUG_TIMES:
             inplayer_time = time.time()-start

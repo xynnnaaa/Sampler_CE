@@ -1214,7 +1214,7 @@ class JoinSampler:
         # 遍历 Trie 的每个 Root 子树
         for root_token, root_node in self.trie.root.children.items():
             parallel += 1
-            if parallel > 8:
+            if parallel >= 12:
                 print(f"\n=== Processing Root Subtree: {root_node.child_alias} ({root_node.real_name}) ===", flush=True)
                 self.sample_trie_root(root_node)
 

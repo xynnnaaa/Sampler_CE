@@ -490,11 +490,15 @@ class NN(CardinalityEstimationAlg):
         else:
             subplan_mask = None
 
+        # CHECK
+        join_emb_dir = getattr(self, "join_embedding_dir", None)
+
         self.trainds = self.init_dataset(training_samples,
                 self.load_query_together,
                 max_num_tables = self.max_num_tables,
                 load_padded_mscn_feats=self.load_padded_mscn_feats,
-                subplan_mask = subplan_mask
+                subplan_mask = subplan_mask,
+                join_embedding_dir=join_emb_dir
                 )
 
         self.trainloader = data.DataLoader(self.trainds,
@@ -521,7 +525,8 @@ class NN(CardinalityEstimationAlg):
         if self.eval_epoch < self.max_epochs:
             if "valqs" in kwargs and len(kwargs["valqs"]) > 0:
                 self.eval_ds["val"] = self.init_dataset(kwargs["valqs"], False,
-                        load_padded_mscn_feats=self.load_padded_mscn_feats)
+                        load_padded_mscn_feats=self.load_padded_mscn_feats,
+                        join_embedding_dir=join_emb_dir)
                 self.samples["val"] = kwargs["valqs"]
 
             # if "valqs" in kwargs and len(kwargs["valqs"]) > 0:
@@ -536,7 +541,8 @@ class NN(CardinalityEstimationAlg):
 
                 self.eval_ds["test"] = self.init_dataset(testqs,
                         False,
-                        load_padded_mscn_feats=self.load_padded_mscn_feats)
+                        load_padded_mscn_feats=self.load_padded_mscn_feats,
+                        join_embedding_dir=join_emb_dir)
                 self.samples["test"] = testqs
 
             if "evalqs" in kwargs and len(kwargs["eval_qdirs"]) > 0:
@@ -560,13 +566,15 @@ class NN(CardinalityEstimationAlg):
                         not_gqname = "CEB-IMDb-NoGroupNoLike"
                         self.eval_ds[gqname] = \
                                 self.init_dataset(group_evalqs, False,
-                                load_padded_mscn_feats=self.load_padded_mscn_feats)
+                                load_padded_mscn_feats=self.load_padded_mscn_feats,
+                                join_embedding_dir=join_emb_dir)
                         self.true_costs[gqname] = 0.0
                         self.samples[gqname] = group_evalqs
 
                         self.eval_ds[not_gqname] = \
                                 self.init_dataset(not_group_evalqs, False,
-                                load_padded_mscn_feats=self.load_padded_mscn_feats)
+                                load_padded_mscn_feats=self.load_padded_mscn_feats,
+                                join_embedding_dir=join_emb_dir)
                         self.true_costs[not_gqname] = 0.0
                         self.samples[not_gqname] = not_group_evalqs
 
@@ -583,7 +591,8 @@ class NN(CardinalityEstimationAlg):
 
                     self.eval_ds[evalqname] = self.init_dataset(cur_evalqs,
                             False,
-                            load_padded_mscn_feats=self.load_padded_mscn_feats)
+                            load_padded_mscn_feats=self.load_padded_mscn_feats,
+                            join_embedding_dir=join_emb_dir)
                     self.true_costs[evalqname] = 0.0
                     self.samples[evalqname] = cur_evalqs
 
@@ -858,6 +867,7 @@ class NN(CardinalityEstimationAlg):
         # pf_mask = torch.from_numpy(pf_mask).float()
         # return tf_mask, jf_mask, pf_mask
 
+    # CHECK
     def train_one_epoch(self):
         if self.loss_func_name == "flowloss":
             torch.set_num_threads(1)
@@ -1042,9 +1052,11 @@ class NN(CardinalityEstimationAlg):
         for each subset graph node (subplan). Each key should be ' ' separated
         list of aliases / table names
         '''
+        join_emb_dir = getattr(self, "join_embedding_dir", None)
         testds = self.init_dataset(test_samples, False,
                 max_num_tables = -1,
-                load_padded_mscn_feats=self.load_padded_mscn_feats)
+                load_padded_mscn_feats=self.load_padded_mscn_feats,
+                join_embedding_dir=join_emb_dir)
 
         start = time.time()
         preds, _ = self._eval_ds(testds, test_samples)

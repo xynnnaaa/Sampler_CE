@@ -59,6 +59,7 @@ def mscn_collate_fn(data):
     alltabs = []
     allpreds = []
     alljoins = []
+    all_join_embeddings = []
 
     flows = []
     ys = []
@@ -81,6 +82,9 @@ def mscn_collate_fn(data):
         if len(alljoins[-1]) > maxjoins:
             maxjoins = len(alljoins[-1])
 
+        if "join_embedding" in d[0]:
+            all_join_embeddings.append(d[0]["join_embedding"])
+
         flows.append(d[0]["flow"])
         ys.append(d[1])
         infos.append(d[2])
@@ -99,6 +103,10 @@ def mscn_collate_fn(data):
     data["tmask"] = tm
     data["pmask"] = pm
     data["jmask"] = jm
+
+    if len(all_join_embeddings) > 0:
+        je = torch.stack(all_join_embeddings).float()
+        data["join_embedding"] = je
 
     return data,ys,infos
 
@@ -191,7 +199,8 @@ class QueryDataset(data.Dataset):
             load_query_together, load_padded_mscn_feats=False,
             max_num_tables = -1,
             subplan_mask = None,
-            join_key_cards=False):
+            join_key_cards=False,
+            join_embedding_dir = None):
         '''
         @samples: [] sqlrep query dictionaries, which represent a query and all
         of its subplans.
@@ -256,6 +265,23 @@ class QueryDataset(data.Dataset):
         self.minv = self.featurizer.min_val
         self.maxv = self.featurizer.max_val
         self.feattype = self.featurizer.featurization_type
+
+        self.join_embedding_dir = join_embedding_dir
+        self.join_embeddings = {}   # {query_name: {subset_tuple: vector}}
+        self.join_emb_dim = 0
+
+        if self.join_embedding_dir is not None:
+            for qrep in samples:
+                qname = qrep["name"].replace(".pkl", "")
+                emb_path = os.path.join(self.join_embedding_dir, qrep["workload"],
+                        qname + ".npy")
+                if os.path.exists(emb_path):
+                    loaded_dict = np.load(emb_path, allow_pickle=True).item()
+                    self.join_embeddings[qrep["name"]] = loaded_dict
+                    if self.join_emb_dim == 0 and len(loaded_dict) > 0:
+                        first_val = next(iter(loaded_dict.values()))
+                        self.join_emb_dim = first_val.shape[0]
+        print("Join embedding dim: ", self.join_emb_dim)
 
         # TODO: we may want to avoid this, and convert them on the fly. Just
         # keep some indexing information around.
@@ -419,6 +445,15 @@ class QueryDataset(data.Dataset):
 
             if self.featurizer.featurization_type == "set":
                 x["flow"] = to_variable(x["flow"], requires_grad=False).float()
+
+            if self.join_embeddings is not None and \
+                    qrep["name"] in self.join_embeddings:
+                query_embs = self.join_embeddings[qrep["name"]]
+                if node in query_embs:
+                    x["join_embedding"] = torch.from_numpy(
+                            query_embs[node]).float()
+                else:
+                    x["join_embedding"] = torch.zeros(self.join_emb_dim).float()
 
             X.append(x)
             Y.append(y)

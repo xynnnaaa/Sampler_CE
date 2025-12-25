@@ -15,12 +15,14 @@ class MSCN(NN):
     def init_dataset(self, samples, load_query_together,
             max_num_tables = -1,
             load_padded_mscn_feats=False,
-            subplan_mask=None):
+            subplan_mask=None,
+            join_embedding_dir = None):
         ds = QueryDataset(samples, self.featurizer,
                 load_query_together,
                 max_num_tables = max_num_tables,
                 load_padded_mscn_feats=load_padded_mscn_feats,
-                subplan_mask=subplan_mask)
+                subplan_mask=subplan_mask,
+                join_embedding_dir=join_embedding_dir)
 
         return ds
 
@@ -42,6 +44,11 @@ class MSCN(NN):
             jfeats = 0
         else:
             jfeats = len(sample[0]["join"][0])
+
+        if "join_embedding" in sample[0]:
+            join_emb_dim = sample[0]["join_embedding"].shape[0]
+        else:
+            join_emb_dim = 0
 
         if self.subplan_level_outputs:
             n_out = 10
@@ -75,7 +82,8 @@ class MSCN(NN):
                     num_hidden_layers = self.num_hidden_layers,
                     dropouts=[self.inp_dropout, self.hl_dropout,
                         self.comb_dropout],
-                    use_sigmoid = use_sigmoid)
+                    use_sigmoid = use_sigmoid,
+                    join_emb_dim=join_emb_dim)
 
         return net
 
