@@ -10,9 +10,9 @@ eval:
   num_processes : 10
 
 data:
-    query_dir: "./my_queries_all/half_ceb_full"
+    query_dir: "./queries/ceb-imdb"
     eval_query_dir: ""
-    bitmap_dir: "./my_queries_all/default_bitmaps/"
+    bitmap_dir: "./queries/single_table_bitmap/"
 
     # query_dir: "./queries/ceb-imdb"
     # eval_query_dir: ""
@@ -45,7 +45,8 @@ data:
     only_pgplan_data : 0
 
     # join sampling新加的参数
-    join_embedding_dir: "./queries/joblight/embeddings"
+    use_join_sampling: False
+    join_embedding_dir: "../join_sampling/embedding/results"
 
 # only need these features for computing plan costs
 db:
@@ -72,7 +73,7 @@ featurizer:
   #bitmap_dir : "./queries/allbitmaps/"
 
   sample_bitmap : 1
-  sample_bitmap_num : 1000
+  sample_bitmap_num : 70
   sample_bitmap_buckets : 1000
   bitmap_onehotmask : 1
 
@@ -118,7 +119,7 @@ model:
   normalize_flow_loss : 1
 
   # important training / optimization flags
-  max_epochs : 1000
+  max_epochs : 2000
   eval_epoch : 4 # how often to evaluate on eval_fns during training
   eval_fns : "qerr,ppc" # logging things during training
   lr : 0.0001
@@ -127,7 +128,7 @@ model:
 
   # keep padded set features in memory; faster to train, takes more RAM
   # CHECK：检查一下如果设成1，join embedding的逻辑是否正确，应该没问题
-  load_padded_mscn_feats : 0
+  load_padded_mscn_feats : 1
 
   cost_model : "C"
 

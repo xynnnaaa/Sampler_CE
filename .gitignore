@@ -7,3 +7,8 @@ imdb_base_only.dump
 .DS_Store
 **/.DS_Store
 mscn/queries/
+mscn/.lc_cache
+mscn/results
+mscn/runfile
+join_sampling/embedding/results
+join_sampling/embedding/single

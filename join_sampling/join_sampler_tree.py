@@ -209,6 +209,8 @@ class JoinSampler:
 
         # root_table = max(aliases, key=root_score)
 
+        aliases = sorted(aliases)
+
         scored = []
         for a in aliases:
             real_name = join_graph.nodes[a]['real_name']
@@ -219,11 +221,11 @@ class JoinSampler:
         root_table = None
 
         for card, alias in scored:
-            if card > 100000:
+            if card > 10000:
                 root_table = alias
                 break
 
-        if root_table is None:
+        if root_table is None or root_table == 'ci' or root_table == 'mi1' or root_table == 'mi2':
             root_table = scored[0][1]
 
         visited = {root_table}
@@ -232,9 +234,8 @@ class JoinSampler:
 
         while len(visited) < len(aliases):
             candidates = []
-
-            for u in visited:
-                for v in join_graph.neighbors(u):
+            for u in sorted(visited):
+                for v in sorted(join_graph.neighbors(u)):
                     if v not in visited:
                         real_name = join_graph.nodes[v]['real_name']
                         card = TABLE_CARD.get(real_name, float("inf"))
@@ -676,6 +677,10 @@ class JoinSampler:
 
             if len(subtree_covered) == total_qids:
                 print("        All queries covered. Stop sampling.")
+                break
+
+            if len(subtree_covered)/total_qids >= 0.90:
+                print("        Coverage >= 90%. Stop sampling.")
                 break
 
             bitmap_start_time = time.time()
@@ -1214,7 +1219,7 @@ class JoinSampler:
         # 遍历 Trie 的每个 Root 子树
         for root_token, root_node in self.trie.root.children.items():
             parallel += 1
-            if parallel >= 12:
+            if parallel == 14:
                 print(f"\n=== Processing Root Subtree: {root_node.child_alias} ({root_node.real_name}) ===", flush=True)
                 self.sample_trie_root(root_node)
 

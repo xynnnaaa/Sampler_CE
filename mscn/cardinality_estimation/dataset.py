@@ -271,17 +271,26 @@ class QueryDataset(data.Dataset):
         self.join_emb_dim = 0
 
         if self.join_embedding_dir is not None:
+            print(f"Join Sampling Enabled. Loading from: {self.join_embedding_dir}")
             for qrep in samples:
-                qname = qrep["name"].replace(".pkl", "")
-                emb_path = os.path.join(self.join_embedding_dir, qrep["workload"],
-                        qname + ".npy")
+                qname = qrep["name"]
+                emb_path = os.path.join(self.join_embedding_dir, qrep["workload"], qname)
                 if os.path.exists(emb_path):
-                    loaded_dict = np.load(emb_path, allow_pickle=True).item()
-                    self.join_embeddings[qrep["name"]] = loaded_dict
-                    if self.join_emb_dim == 0 and len(loaded_dict) > 0:
-                        first_val = next(iter(loaded_dict.values()))
-                        self.join_emb_dim = first_val.shape[0]
-        print("Join embedding dim: ", self.join_emb_dim)
+                    with open(emb_path, "rb") as f:
+                        loaded_dict = pickle.load(f)
+                        self.join_embeddings[qrep["name"]] = loaded_dict
+                        if self.join_emb_dim == 0 and len(loaded_dict) > 0:
+                            first_val = next(iter(loaded_dict.values()))
+                            self.join_emb_dim = first_val.shape[0]
+                else:
+                    print("Warning: Join embedding file not found for query:", qname)
+                    pass
+            print("Join embedding dim: ", self.join_emb_dim)
+
+        else:
+            print("Join Sampling Disabled. Using original MSCN structure.")
+            self.join_embeddings = {}
+            self.join_emb_dim = 0
 
         # TODO: we may want to avoid this, and convert them on the fly. Just
         # keep some indexing information around.
@@ -448,12 +457,20 @@ class QueryDataset(data.Dataset):
 
             if self.join_embeddings is not None and \
                     qrep["name"] in self.join_embeddings:
+                node_key = tuple(sorted(list(node)))
                 query_embs = self.join_embeddings[qrep["name"]]
-                if node in query_embs:
-                    x["join_embedding"] = torch.from_numpy(
-                            query_embs[node]).float()
+                if node_key in query_embs:
+                    x["join_embedding"] = query_embs[node_key].clone().float()
                 else:
+                    if len(node) > 1:
+                        print("Warning: join embedding not found for node ", node_key,
+                                " in query ", qrep["name"])
                     x["join_embedding"] = torch.zeros(self.join_emb_dim).float()
+
+            else:
+                if self.join_emb_dim > 0:
+                    x["join_embedding"] = torch.zeros(self.join_emb_dim).float()
+                    print("Warning: join embedding not found for query ", qrep["name"])
 
             X.append(x)
             Y.append(y)
@@ -477,8 +494,7 @@ class QueryDataset(data.Dataset):
                 self.featurizer.join_bitmap:
             assert self.featurizer.bitmap_dir is not None
 
-            bitdir = os.path.join(self.featurizer.bitmap_dir, qrep["workload"],
-                    "sample_bitmap")
+            bitdir = os.path.join(self.featurizer.bitmap_dir, qrep["workload"])
 
             bitmapfn = os.path.join(bitdir, qrep["name"])
 

@@ -68,15 +68,16 @@ def eval_alg(alg, eval_funcs, qreps, cfg,
                 alg_name = alg_name,
                 save_pdf_plans= cfg["eval"]["save_pdf_plans"],
                 query_dir = cfg["data"]["query_dir"],
-                result_dir = args.result_dir,
+                result_dir = rdir,
                 use_wandb = cfg["eval"]["use_wandb"],
                 featurizer = featurizer, alg=alg)
 
-        print("{}, {}, {}, #samples: {}, {}: mean: {}, median: {}, 99p: {}"\
+        print("{}, {}, {}, #samples: {}, {}: mean: {}, median: {}, 99p: {}, max: {}"\
                 .format(cfg["db"]["db_name"], samples_type, alg, len(errors),
                     efunc.__str__(), np.round(np.mean(errors),3),
                     np.round(np.median(errors),3),
-                    np.round(np.percentile(errors,99),3)))
+                    np.round(np.percentile(errors,99),3),
+                    np.round(np.max(errors),3)))
 
         if cfg["eval"]["use_wandb"]:
             loss_key = "Final-{}-{}-{}".format(str(efunc), samples_type,

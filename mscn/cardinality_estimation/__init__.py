@@ -40,9 +40,13 @@ def get_alg(alg, cfg):
                 use_wandb = cfg["eval"]["use_wandb"],
                 )
     elif alg == "mscn":
+        use_js = cfg["data"].get("use_join_sampling", False)
+        je_dir = cfg["data"].get("join_embedding_dir", None) if use_js else None
+
         return MSCN(
                 cfg["model"],
                 use_wandb = cfg["eval"]["use_wandb"],
+                join_embedding_dir = je_dir
                 )
 
     elif alg == "mstn":

@@ -389,6 +389,7 @@ class Featurizer():
         self.use_join_sample_embedding = True
         self.use_single_table_sample_embedding = True
         self.embedding_file_path = None
+        self.embedding_dim = 768
 
     def update_workload_means(self, qreps):
         '''
@@ -498,8 +499,7 @@ class Featurizer():
 
             if self.sample_bitmap:
                 sbitmaps = None
-                sbitdir = os.path.join(self.bitmap_dir, qrep["workload"],
-                        "sample_bitmap")
+                sbitdir = os.path.join(self.bitmap_dir, qrep["workload"])
 
                 bitmapfn = os.path.join(sbitdir, qrep["name"])
 
