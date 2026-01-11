@@ -30,6 +30,41 @@ COUNT_SIZE_TEMPLATE = "SELECT COUNT(*) FROM {FROM_CLAUSE}"
 REGEX_TEMPLATES = ['10a', '11a', '11b', '3b', '9b', '9a']
 TIMEOUT_CARD = 150001000000
 
+import torch
+import numpy as np
+
+def is_valid_join_embedding(qname, node, join_embeddings):
+    """
+    统一判断逻辑：如果 join embedding 存在且全为 0，则返回 False（表示跳过）。
+    否则返回 True（表示保留）。
+    """
+    # 如果没有启用 embedding，默认所有样本有效
+    if join_embeddings is None or len(join_embeddings) == 0:
+        return True
+
+    # 如果该查询不在 embedding 字典中
+    if qname not in join_embeddings:
+        return False 
+    
+    # 构建 key (保持与 dataset.py 一致的排序逻辑)
+    node_key = tuple(sorted(list(node)))
+    query_embs = join_embeddings[qname]
+
+    if node_key not in query_embs:
+        return False # 找不到对应 subplan 的 embedding，视为全零 -> 过滤
+
+    emb = query_embs[node_key]
+
+    # 核心检查：是否全零
+    if isinstance(emb, torch.Tensor):
+        if torch.all(emb == 0):
+            return False
+    elif isinstance(emb, np.ndarray):
+        if np.all(emb == 0):
+            return False
+            
+    return True
+
 def update_job_parsing(qrep):
     '''
     fixes some error in the predicates parsed from JOB.

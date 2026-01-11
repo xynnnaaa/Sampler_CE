@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from .plan_losses import PPC, PlanCost,get_leading_hint
 from .cost_model import *
 # from query_representation.utils import deterministic_hash,make_dir
+from query_representation.utils import is_valid_join_embedding
 
 from query_representation.viz import *
 from matplotlib.backends.backend_pdf import PdfPages
@@ -313,6 +314,8 @@ class QError(EvalFunc):
         else:
             samples_type = ""
 
+        join_embeddings = kwargs.get("join_embeddings", None)
+
         num_table_errs = defaultdict(list)
         didx = 0
         qnames = []
@@ -324,6 +327,8 @@ class QError(EvalFunc):
                 nodes.remove(SOURCE_NODE)
             nodes.sort()
             for qi, node in enumerate(nodes):
+                if not is_valid_join_embedding(qrep["name"], node, join_embeddings):
+                    continue
                 numt = len(node)
                 if didx >= len(errors):
                     # assert False
@@ -355,6 +360,8 @@ class QError(EvalFunc):
         assert len(preds) == len(qreps)
         assert isinstance(preds[0], dict)
 
+        join_embeddings = kwargs.get("join_embeddings", None)
+
         ytrue, yhat = _get_all_cardinalities(qreps, preds)
         assert len(ytrue) == len(yhat)
 
@@ -364,7 +371,7 @@ class QError(EvalFunc):
         errors = np.maximum((ytrue / yhat), (yhat / ytrue))
 
         if kwargs["result_dir"] is not None:
-            self.save_logs(qreps, errors, **kwargs)
+            self.save_logs(qreps, errors, join_embeddings=join_embeddings, **kwargs)
 
         return errors
 

@@ -172,7 +172,7 @@ def format_model_test_output_joinkey(pred, samples, featurizer):
 
     return all_ests
 
-def format_model_test_output(pred, samples, featurizer):
+def format_model_test_output(pred, samples, featurizer, join_embeddings=None):
     all_ests = []
     query_idx = 0
     # print("len pred: ", len(pred))
@@ -184,7 +184,8 @@ def format_model_test_output(pred, samples, featurizer):
             node_keys.remove(SOURCE_NODE)
         node_keys.sort()
 
-        subq_idx = 0
+        # subq_idx = 0
+
         for _, node in enumerate(node_keys):
             # if featurizer.max_num_tables != -1 and \
                 # featurizer.max_num_tables < len(node):
@@ -192,9 +193,12 @@ def format_model_test_output(pred, samples, featurizer):
                 # ests[node] = 1.0
                 # continue
 
+            if not is_valid_join_embedding(sample["name"], node, join_embeddings):
+                continue
+
             cards = sample["subset_graph"].nodes()[node]["cardinality"]
             alias_key = node
-            idx = query_idx + subq_idx
+            idx = query_idx
             if "total" in cards:
                 est_card = featurizer.unnormalize(pred[idx], cards["total"])
             else:
@@ -202,11 +206,11 @@ def format_model_test_output(pred, samples, featurizer):
 
             assert est_card > 0
             ests[alias_key] = est_card
-            subq_idx += 1
+            query_idx += 1
 
         all_ests.append(ests)
         # query_idx += len(node_keys)
-        query_idx += subq_idx
+        # query_idx += subq_idx
 
     return all_ests
 
@@ -305,6 +309,8 @@ class NN(CardinalityEstimationAlg):
 
             preds, _ = self._eval_ds(ds, samples)
 
+            current_join_embeddings = getattr(ds, "join_embeddings", None)
+
             if self.featurizer.card_type == "joinkey":
                 preds1 = format_model_test_output_joinkey(preds,
                         samples, self.featurizer)
@@ -315,7 +321,7 @@ class NN(CardinalityEstimationAlg):
 
             else:
                 preds = format_model_test_output(preds,
-                        samples, self.featurizer)
+                        samples, self.featurizer, join_embeddings=current_join_embeddings)
                 assert len(preds) == len(samples)
 
             # do evaluations
@@ -355,7 +361,8 @@ class NN(CardinalityEstimationAlg):
                         num_processes = 16,
                         alg_name = self.__str__(),
                         save_pdf_plans=False,
-                        use_wandb=False)
+                        use_wandb=False,
+                        join_embeddings=current_join_embeddings)
 
                 if "PostgresPlanCost-C" == str(efunc):
                     assert truecost != 0.0

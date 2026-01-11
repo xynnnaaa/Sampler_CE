@@ -432,6 +432,11 @@ class QueryDataset(data.Dataset):
                     list(node) not in submask:
                 continue
 
+            # 新增过滤条件：检查 join embedding 是否有效
+            if not is_valid_join_embedding(qrep["name"], node,
+                    self.join_embeddings):
+                continue
+
             x,y = self.featurizer.get_subplan_features(qrep,
                     node, bitmaps=sbitmaps,
                     join_bitmaps=jbitmaps)
@@ -477,7 +482,9 @@ class QueryDataset(data.Dataset):
 
             cur_info = {}
             cur_info["num_tables"] = len(node)
-            cur_info["dataset_idx"] = dataset_qidx + node_idx
+            # cur_info["dataset_idx"] = dataset_qidx + node_idx
+            # 修改 dataset_idx 的计算方式，确保连续正确
+            cur_info["dataset_idx"] = dataset_qidx + len(Y) - 1
             cur_info["query_idx"] = query_idx
             cur_info["node"] = str(node)
             sample_info.append(cur_info)
