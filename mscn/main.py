@@ -263,7 +263,7 @@ def read_flags():
     parser.add_argument("--result_dir", type=str, required=False,
             default="./results")
     parser.add_argument("--eval_fns", type=str, required=False,
-            default="ppc,qerr")
+            default="qerr")
 
     return parser.parse_args()
 

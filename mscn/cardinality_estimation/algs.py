@@ -1068,10 +1068,12 @@ class NN(CardinalityEstimationAlg):
         start = time.time()
         preds, _ = self._eval_ds(testds, test_samples)
 
+        current_join_embeddings = getattr(testds, "join_embeddings", None)
+
         if self.featurizer.card_type == "joinkey":
             return format_model_test_output_joinkey(preds, test_samples, self.featurizer)
         else:
-            return format_model_test_output(preds, test_samples, self.featurizer)
+            return format_model_test_output(preds, test_samples, self.featurizer, join_embeddings=current_join_embeddings)
 
     def get_exp_name(self):
         name = self.__str__()

@@ -270,6 +270,9 @@ class QueryDataset(data.Dataset):
         self.join_embeddings = {}   # {query_name: {subset_tuple: vector}}
         self.join_emb_dim = 0
 
+        # 新加的特殊处理
+        self.sub_use_join_embedding = True
+
         if self.join_embedding_dir is not None:
             print(f"Join Sampling Enabled. Loading from: {self.join_embedding_dir}")
             for qrep in samples:
@@ -460,22 +463,23 @@ class QueryDataset(data.Dataset):
             if self.featurizer.featurization_type == "set":
                 x["flow"] = to_variable(x["flow"], requires_grad=False).float()
 
-            if self.join_embeddings is not None and \
-                    qrep["name"] in self.join_embeddings:
-                node_key = tuple(sorted(list(node)))
-                query_embs = self.join_embeddings[qrep["name"]]
-                if node_key in query_embs:
-                    x["join_embedding"] = query_embs[node_key].clone().float()
-                else:
-                    if len(node) > 1:
-                        print("Warning: join embedding not found for node ", node_key,
-                                " in query ", qrep["name"])
-                    x["join_embedding"] = torch.zeros(self.join_emb_dim).float()
+            if self.sub_use_join_embedding:
+                if self.join_embeddings is not None and \
+                        qrep["name"] in self.join_embeddings:
+                    node_key = tuple(sorted(list(node)))
+                    query_embs = self.join_embeddings[qrep["name"]]
+                    if node_key in query_embs:
+                        x["join_embedding"] = query_embs[node_key].clone().float()
+                    else:
+                        if len(node) > 1:
+                            print("Warning: join embedding not found for node ", node_key,
+                                    " in query ", qrep["name"])
+                        x["join_embedding"] = torch.zeros(self.join_emb_dim).float()
 
-            else:
-                if self.join_emb_dim > 0:
-                    x["join_embedding"] = torch.zeros(self.join_emb_dim).float()
-                    print("Warning: join embedding not found for query ", qrep["name"])
+                else:
+                    if self.join_emb_dim > 0:
+                        x["join_embedding"] = torch.zeros(self.join_emb_dim).float()
+                        print("Warning: join embedding not found for query ", qrep["name"])
 
             X.append(x)
             Y.append(y)
