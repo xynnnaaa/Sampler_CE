@@ -85,32 +85,33 @@ class SetConv(nn.Module):
         self.sample_mlps = nn.ModuleList()
         self.predicate_mlps = nn.ModuleList()
         self.join_mlps = nn.ModuleList()
+        self.jse_mlps = nn.ModuleList() # 新增：JSE 的子网络
 
         if hid_units < 4:
             # gonna treat this as a multiple
             sample_hid_units = int(sample_feats * hid_units)
             pred_hid_units = int(predicate_feats * hid_units)
             join_hid_units = int(join_feats * hid_units)
-            combined_size = sample_hid_units + pred_hid_units + join_hid_units
+            jse_hid_units = int(join_emb_dim * hid_units) if join_emb_dim > 0 else 0
+            combined_size = sample_hid_units + pred_hid_units + join_hid_units + jse_hid_units
             combined_hid_units = int(combined_size * hid_units)
         else:
             ## takes less memory etc. when some have very few inp features
             sample_hid_units = int(min(hid_units, int(2*sample_feats)))
             pred_hid_units = int(min(hid_units, int(2*predicate_feats)))
             join_hid_units = int(min(hid_units, int(2*join_feats)))
+            jse_hid_units = int(hid_units) if join_emb_dim > 0 else 0
             ## temporary to fix all input lengths being same
             # sample_hid_units = int(hid_units)
             # pred_hid_units = int(hid_units)
             # join_hid_units = int(hid_units)
 
-            combined_size = sample_hid_units + pred_hid_units + join_hid_units
+            combined_size = sample_hid_units + pred_hid_units + join_hid_units + jse_hid_units
 
             if other_hid_units is None:
                 combined_hid_units = hid_units
             else:
                 combined_hid_units = other_hid_units
-
-        combined_size += self.join_emb_dim
 
 
         if self.sample_feats != 0:
@@ -134,6 +135,13 @@ class SetConv(nn.Module):
             for i in range(0, self.num_hidden_layers-1):
                 self.join_mlps.append(nn.Linear(join_hid_units,
                     join_hid_units).to(device))
+                
+        if self.join_emb_dim > 0:
+            jse_mlp1 = nn.Linear(join_emb_dim, jse_hid_units).to(device)
+            self.jse_mlps.append(jse_mlp1)
+            for i in range(0, self.num_hidden_layers-1):
+                self.jse_mlps.append(nn.Linear(jse_hid_units,
+                    jse_hid_units).to(device))
 
         # Note: flow_feats is just used to concatenate global features, such as
         # pg_est at end of layer outputs
@@ -244,9 +252,16 @@ class SetConv(nn.Module):
             tocat.append(hid_join)
 
         if join_sample_embs is not None and self.join_emb_dim > 0:
-            join_embs = join_sample_embs.to(device, non_blocking=True)
-            join_embs = self.inp_drop_layer(join_embs)
-            tocat.append(join_embs)
+            # join_embs = join_sample_embs.to(device, non_blocking=True)
+            # join_embs = self.inp_drop_layer(join_embs)
+            # tocat.append(join_embs)
+            
+            hid_jse = join_sample_embs.to(device, non_blocking=True)
+            hid_jse = self.inp_drop_layer(hid_jse)
+            for layer in self.jse_mlps:
+                hid_jse = F.relu(layer(hid_jse))
+                hid_jse = self.hl_drop_layer(hid_jse)
+            tocat.append(hid_jse.squeeze())
 
         if DEBUG_TIMES:
             inplayer_time = time.time()-start
@@ -963,3 +978,244 @@ class SetConvNoFlow(nn.Module):
         out = torch.sigmoid(self.out_mlp2(hid))
         # print("out: ", out)
         return out
+
+
+
+# # minor modifications on the MSCN model in Kipf et al.
+# class SetConv(nn.Module):
+#     def __init__(self, sample_feats, predicate_feats, join_feats,
+#             flow_feats,
+#             hid_units,
+#             other_hid_units,
+#             num_hidden_layers=2, n_out=1,
+#             dropouts=[0.0, 0.0, 0.0], use_sigmoid=True,
+#             join_emb_dim=0):
+#         super(SetConv, self).__init__()
+
+#         ## debug time code
+#         self.total_fwd_time = 0.0
+
+#         hid_units = int(hid_units)
+#         if other_hid_units is not None:
+#             other_hid_units = int(other_hid_units)
+
+#         self.use_sigmoid = use_sigmoid
+
+#         self.sample_feats = sample_feats
+#         self.predicate_feats = predicate_feats
+#         self.join_feats = join_feats
+#         self.flow_feats = flow_feats
+#         self.num_hidden_layers = num_hidden_layers
+#         num_layer1_blocks = 0
+
+#         self.join_emb_dim = join_emb_dim
+
+#         self.inp_drop = dropouts[0]
+#         self.hl_drop = dropouts[1]
+#         self.combined_drop = dropouts[2]
+#         self.inp_drop_layer = nn.Dropout(p=self.inp_drop)
+#         self.hl_drop_layer = nn.Dropout(p=self.hl_drop)
+#         self.combined_drop_layer = nn.Dropout(p=self.combined_drop)
+
+#         self.sample_mlps = nn.ModuleList()
+#         self.predicate_mlps = nn.ModuleList()
+#         self.join_mlps = nn.ModuleList()
+
+#         if hid_units < 4:
+#             # gonna treat this as a multiple
+#             sample_hid_units = int(sample_feats * hid_units)
+#             pred_hid_units = int(predicate_feats * hid_units)
+#             join_hid_units = int(join_feats * hid_units)
+#             combined_size = sample_hid_units + pred_hid_units + join_hid_units
+#             combined_hid_units = int(combined_size * hid_units)
+#         else:
+#             ## takes less memory etc. when some have very few inp features
+#             sample_hid_units = int(min(hid_units, int(2*sample_feats)))
+#             pred_hid_units = int(min(hid_units, int(2*predicate_feats)))
+#             join_hid_units = int(min(hid_units, int(2*join_feats)))
+#             ## temporary to fix all input lengths being same
+#             # sample_hid_units = int(hid_units)
+#             # pred_hid_units = int(hid_units)
+#             # join_hid_units = int(hid_units)
+
+#             combined_size = sample_hid_units + pred_hid_units + join_hid_units
+
+#             if other_hid_units is None:
+#                 combined_hid_units = hid_units
+#             else:
+#                 combined_hid_units = other_hid_units
+
+#         combined_size += self.join_emb_dim
+
+
+#         if self.sample_feats != 0:
+#             sample_mlp1 = nn.Linear(sample_feats, sample_hid_units).to(device)
+#             self.sample_mlps.append(sample_mlp1)
+#             for i in range(0, self.num_hidden_layers-1):
+#                 self.sample_mlps.append(nn.Linear(sample_hid_units,
+#                     sample_hid_units).to(device))
+
+
+#         if self.predicate_feats != 0:
+#             predicate_mlp1 = nn.Linear(predicate_feats, pred_hid_units).to(device)
+#             self.predicate_mlps.append(predicate_mlp1)
+#             for i in range(0, self.num_hidden_layers-1):
+#                 self.predicate_mlps.append(nn.Linear(pred_hid_units,
+#                     pred_hid_units).to(device))
+
+#         if self.join_feats != 0:
+#             join_mlp1 = nn.Linear(join_feats, join_hid_units).to(device)
+#             self.join_mlps.append(join_mlp1)
+#             for i in range(0, self.num_hidden_layers-1):
+#                 self.join_mlps.append(nn.Linear(join_hid_units,
+#                     join_hid_units).to(device))
+
+#         # Note: flow_feats is just used to concatenate global features, such as
+#         # pg_est at end of layer outputs
+
+#         comb_size = combined_size + flow_feats
+#         combined_hid_size = combined_hid_units + flow_feats
+
+#         self.out_mlp1 = nn.Linear(comb_size,
+#                 combined_hid_size).to(device)
+
+#         # unless flow_feats is 0
+#         combined_hid_size += flow_feats
+#         self.out_mlp2 = nn.Linear(combined_hid_size, n_out).to(device)
+
+#     def forward(self, xbatch):
+#         '''
+#         #TODO: describe shapes
+#         '''
+#         start = time.time()
+
+#         samples = xbatch["table"]
+#         predicates = xbatch["pred"]
+#         joins = xbatch["join"]
+#         flows = xbatch["flow"]
+
+#         join_sample_embs = xbatch.get("join_embedding", None)
+
+#         sample_mask = xbatch["tmask"]
+#         predicate_mask = xbatch["pmask"]
+#         join_mask = xbatch["jmask"]
+
+#         tocat = []
+#         if self.sample_feats != 0:
+#             samples = samples.to(device, non_blocking=True)
+#             samples = self.inp_drop_layer(samples)
+
+#             ## hardcoded layers
+#             # hid_sample = F.relu(self.sample_mlp1(samples))
+#             # hid_sample = self.hl_drop_layer(hid_sample)
+#             # if self.num_hidden_layers == 2:
+#                 # hid_sample = F.relu(self.sample_mlp2(hid_sample))
+
+#             hid_sample = samples
+#             for i in range(0, self.num_hidden_layers):
+#                 hid_sample = F.relu(self.sample_mlps[i](hid_sample))
+#                 hid_sample = self.hl_drop_layer(hid_sample)
+
+#             sample_mask = sample_mask.to(device, non_blocking=True)
+#             hid_sample = hid_sample * sample_mask
+#             hid_sample = torch.sum(hid_sample, dim=1, keepdim=False)
+
+#             if torch.sum(sample_mask) == 0:
+#                 hid_sample = torch.zeros(hid_sample.shape).squeeze()
+#             else:
+#                 sample_norm = sample_mask.sum(1, keepdim=False)
+#                 hid_sample = hid_sample / sample_norm
+#                 hid_sample = hid_sample.squeeze()
+
+#             tocat.append(hid_sample)
+
+#         if self.predicate_feats != 0:
+#             predicates = predicates.to(device, non_blocking=True)
+#             predicate_mask = predicate_mask.to(device, non_blocking=True)
+#             predicates = self.inp_drop_layer(predicates)
+
+#             # hid_predicate = F.relu(self.predicate_mlp1(predicates))
+#             # hid_predicate = self.hl_drop_layer(hid_predicate)
+#             # if self.num_hidden_layers == 2:
+#                 # hid_predicate = F.relu(self.predicate_mlp2(hid_predicate))
+
+#             hid_predicate = predicates
+#             for i in range(0, self.num_hidden_layers):
+#                 hid_predicate = F.relu(self.predicate_mlps[i](hid_predicate))
+#                 hid_predicate = self.hl_drop_layer(hid_predicate)
+
+#             hid_predicate = hid_predicate * predicate_mask
+#             hid_predicate = torch.sum(hid_predicate, dim=1, keepdim=False)
+#             predicate_norm = predicate_mask.sum(1, keepdim=False)
+#             hid_predicate = hid_predicate / predicate_norm
+#             hid_predicate = hid_predicate.squeeze()
+#             tocat.append(hid_predicate)
+
+#         if self.join_feats != 0:
+#             joins = joins.to(device, non_blocking=True)
+#             joins = self.inp_drop_layer(joins)
+#             join_mask = join_mask.to(device, non_blocking=True)
+
+#             # hid_join = F.relu(self.join_mlp1(joins))
+#             # hid_join = self.hl_drop_layer(hid_join)
+#             # if self.num_hidden_layers == 2:
+#                 # hid_join = F.relu(self.join_mlp2(hid_join))
+
+#             hid_join = joins
+#             for i in range(0, self.num_hidden_layers):
+#                 hid_join = F.relu(self.join_mlps[i](hid_join))
+#                 hid_join = self.hl_drop_layer(hid_join)
+
+#             hid_join = hid_join * join_mask
+#             hid_join = torch.sum(hid_join, dim=1, keepdim=False)
+
+#             if torch.sum(join_mask) == 0:
+#                 hid_join = torch.zeros(hid_join.shape).squeeze()
+#             else:
+#                 join_norm = join_mask.sum(1, keepdim=False)
+#                 hid_join = hid_join / join_norm
+#                 hid_join = hid_join.squeeze()
+
+#             tocat.append(hid_join)
+
+#         if join_sample_embs is not None and self.join_emb_dim > 0:
+#             join_embs = join_sample_embs.to(device, non_blocking=True)
+#             join_embs = self.inp_drop_layer(join_embs)
+#             tocat.append(join_embs)
+
+#         if DEBUG_TIMES:
+#             inplayer_time = time.time()-start
+
+#         if self.flow_feats:
+#             flows = flows.to(device, non_blocking=True)
+#             flows = self.inp_drop_layer(flows)
+#             # hid_flow = F.relu(self.flow_mlp1(flows))
+#             # hid_flow = self.hl_drop_layer(hid_flow)
+#             # hid_flow = F.relu(self.flow_mlp2(hid_flow))
+#             tocat.append(flows)
+
+#         try:
+#             hid = torch.cat(tocat, 1)
+#         except Exception as e:
+#             print(e)
+#             print("forward pass torch.cat failed")
+#             pdb.set_trace()
+
+#         hid = self.combined_drop_layer(hid)
+
+#         hid = F.relu(self.out_mlp1(hid))
+#         if self.flow_feats:
+#             hid = torch.cat([hid, flows], 1)
+
+#         if self.use_sigmoid:
+#             out = torch.sigmoid(self.out_mlp2(hid))
+#         else:
+#             out = self.out_mlp2(hid)
+
+#         total_time = time.time()-start
+
+#         if DEBUG_TIMES:
+#             # print("Ratio total / input layer: ", round(inplayer_time / total_time, 6))
+#             self.total_fwd_time += total_time - inplayer_time
+
+#         return out

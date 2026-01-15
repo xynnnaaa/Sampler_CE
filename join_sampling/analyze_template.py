@@ -346,10 +346,24 @@ class WorkloadAnalyzer:
         对提取出的唯一 Template 构建 Trie 树并计数
         """
         print("\nBuilding Trie from Join Templates...")
+
+        cnt = 0
         
         for idx, (key, sub_graph) in enumerate(self.unique_templates.items()):
             aliases = list(key[0])
-            
+
+            # 只要所有表基数都小于10000的模版
+            all_small = True
+            for alias in aliases:
+                real_name = sub_graph.nodes[alias]['real_name']
+                card = TABLE_CARD.get(real_name, float("inf"))
+                if card >= 1000000:
+                    all_small = False
+                    cnt += 1
+                    break
+            if not all_small:
+                continue
+
             try:
                 path_signature = get_deterministic_execution_plan(sub_graph, aliases)
             except Exception as e:
@@ -371,6 +385,8 @@ class WorkloadAnalyzer:
         print(f"Minimum Chains Needed  : {leaf_count}")
         print(f"Optimization Ratio     : {100 * (1 - leaf_count / len(self.unique_templates)):.2f}% reduction")
         print("=" * 40)
+
+        print(cnt)
 
         subtree_stats = self.trie.count_root_subtrees()
 
