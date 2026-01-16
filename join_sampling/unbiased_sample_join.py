@@ -41,7 +41,7 @@ class JoinSamplingEngine:
         加载数据 (逻辑保持不变，确保所有可能用到的连接列都建立了索引)
         """
         self.connect()
-        # self.global_cache.clear() # 根据需要决定是否清空
+        self.global_cache.clear() # 根据需要决定是否清空
 
         pid_map_full = template_data.get('pid_map', {})
         global_map_full = template_data.get('global_map', {})
@@ -59,10 +59,7 @@ class JoinSamplingEngine:
             my_global_mask = global_map_full.get(alias, 0)
             sidecar_name = f"{real_name}_anno_idx_{workload_name}" if workload_name else f"{real_name}_anno_idx"
 
-            cols = set(join_keys)
-            cols.add('id')
-            sorted_cols = sorted(list(cols))
-            cols_str = ", ".join([f"t.{c}" for c in sorted_cols])
+            cols_str = ", ".join([f"t.{c}" for c in join_keys])
 
             sql = f"""
                 SELECT {cols_str}, s.query_anno::text
@@ -74,7 +71,7 @@ class JoinSamplingEngine:
             
             row_map = {}
             indexes = defaultdict(lambda: defaultdict(list))
-            col_name_to_idx = {name: i for i, name in enumerate(sorted_cols)}
+            col_name_to_idx = {name: i for i, name in enumerate(join_keys)}
             id_idx = col_name_to_idx['id']
 
             for r in rows:
@@ -99,26 +96,23 @@ class JoinSamplingEngine:
     def _get_candidates(self, alias, conds, context_data):
         """
         获取候选行 ID。
-        关键修改：target_alias (ancestor) 既可以是 Lookahead 树中的父节点，
-        也可以是 T (context_data) 中的表。只要在 context_data 里就能连。
         """
         candidates = None
         
         # conds结构: [(my_col, target_alias, target_col), ...]
         for my_col, target_alias, target_col in conds:
-            if target_alias not in context_data:
-                # 依赖缺失，说明路径断了
+            if target_alias not in context_data or target_col not in context_data[target_alias]:
+                print(f"  [Warning] Missing context for {target_alias}.{target_col}")
                 return []
             
             target_val = context_data[target_alias][target_col]
-            
-            # 利用内存索引查找
+
             matched = self.global_cache[alias]['indexes'][my_col].get(target_val, [])
             
             if candidates is None:
                 candidates = set(matched)
             else:
-                candidates &= set(matched) # 多个条件取交集
+                candidates &= set(matched) # 多个join条件取交集，现在的workload应该只有一个条件
             
             if not candidates: break
             
