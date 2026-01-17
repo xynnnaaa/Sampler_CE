@@ -17,6 +17,9 @@ class JoinSamplingEngine:
         # }
         self.global_cache = {}
 
+        # 上界缓存，结构: {node_name: {tuple_id: weight}}
+        self.memo = defaultdict(dict)
+
     def connect(self):
         if not self.conn:
             self.conn = psycopg2.connect(**self.db_config)
@@ -134,6 +137,10 @@ class JoinSamplingEngine:
         
         # 2. 遍历候选，累加权重
         for cid in candidates:
+            if cid in self.memo[alias]:
+                total_weight += self.memo[alias][cid]
+                continue
+
             # 将当前选中行加入上下文，供子节点查询
             context_data[alias] = self.global_cache[alias]['rows'][cid]
             
@@ -151,6 +158,7 @@ class JoinSamplingEngine:
             del context_data[alias] # 回溯
             
             if is_valid:
+                self.memo[alias][cid] = node_weight
                 total_weight += node_weight
                 
         return total_weight

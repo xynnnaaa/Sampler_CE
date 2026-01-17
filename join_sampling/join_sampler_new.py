@@ -757,6 +757,8 @@ class JoinSampler:
 
             # 扩展 Beam 中的每一个元组
             next_candidates_heap = [] # Min-heap for Top-K
+
+            self.engine.memo.clear() # 清空权重缓存
             
             for t_tuple in current_beam:
                 current_ids = t_tuple['ids'] # dict {alias: pk}
