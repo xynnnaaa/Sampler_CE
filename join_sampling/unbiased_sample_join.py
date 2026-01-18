@@ -45,24 +45,22 @@ class JoinSamplingEngine:
         """
         self.connect()
         self.global_cache.clear() # 根据需要决定是否清空
-
-        pid_map_full = template_data.get('pid_map', {})
-        global_map_full = template_data.get('global_map', {})
         
         # print(f"  [Engine] Preloading {len(tables_info)} tables...")
 
         for t_info in tables_info:
+            print(f"    - Preloading table alias: {t_info['alias']}")
             alias = t_info['alias']
             if alias in self.global_cache: continue 
 
             real_name = t_info['real_name']
             join_keys = t_info['join_keys']
             
-            my_pid_map = pid_map_full.get(alias, {})
-            my_global_mask = global_map_full.get(alias, 0)
             sidecar_name = f"{real_name}_anno_idx_{workload_name}" if workload_name else f"{real_name}_anno_idx"
 
             cols_str = ", ".join([f"t.{c}" for c in join_keys])
+
+            time_start = time.time()
 
             sql = f"""
                 SELECT {cols_str}, s.query_anno::text
@@ -71,24 +69,32 @@ class JoinSamplingEngine:
             """
             self.cursor.execute(sql)
             rows = self.cursor.fetchall()
+
+            print(f"      Loaded {len(rows)} rows from {real_name} in {time.time() - time_start:.2f}s")
             
             row_map = {}
             indexes = defaultdict(lambda: defaultdict(list))
             col_name_to_idx = {name: i for i, name in enumerate(join_keys)}
             id_idx = col_name_to_idx['id']
 
-            for r in rows:
+            time_start = time.time()
+
+            for i, r in enumerate(rows):
                 pk_id = str(r[id_idx])
                 raw_bitmap = r[-1]
-                qid_mask = self._translate_pid_bitmap(raw_bitmap, my_pid_map, my_global_mask)
+                # qid_mask = self._translate_pid_bitmap(raw_bitmap, my_pid_map, my_global_mask)
                 
-                row_data = {'_bmp': qid_mask}
+                row_data = {'pid_bmp': raw_bitmap}
                 for col, idx in col_name_to_idx.items():
                     val = str(r[idx])
                     row_data[col] = val
                     indexes[col][val].append(pk_id)
                 
                 row_map[pk_id] = row_data
+
+                if (i + 1) % 1000000 == 0:
+                    print(f"        Processed {i + 1} rows in {time.time() - time_start:.2f}s")
+                    time_start = time.time()
             
             self.global_cache[alias] = {
                 'rows': row_map,
@@ -163,7 +169,7 @@ class JoinSamplingEngine:
                 
         return total_weight
 
-    def _sample_subtree_recursive(self, tree_node, context_data):
+    def _sample_subtree_recursive(self, tree_node, context_data, pid_map=None, global_map=None):
         """
         递归采样 (Tree-based Sampling)
         返回: 当前子树采样到的 Bitmap (OR 聚合)
@@ -215,12 +221,15 @@ class JoinSamplingEngine:
         # 4. 递归采样所有子分支
         row_data = self.global_cache[alias]['rows'][sel_cid]
         context_data[alias] = row_data
+
+        cur_pid_map = pid_map.get(alias, {})
+        cur_global_mask = global_map.get(alias, 0)
         
-        final_bitmap = row_data['_bmp']
+        final_bitmap = self._translate_pid_bitmap(row_data['pid_bmp'], cur_pid_map, cur_global_mask)
         
         # 对于选中的行，我们需要合并所有子节点的采样结果 (Union/OR)
         for child_node in children:
-            child_bmp = self._sample_subtree_recursive(child_node, context_data)
+            child_bmp = self._sample_subtree_recursive(child_node, context_data, pid_map, global_map)
             if child_bmp is None:
                 del context_data[alias]
                 return None # 只要有一个子分支断了，整个样本作废
@@ -230,7 +239,7 @@ class JoinSamplingEngine:
         del context_data[alias] # 回溯
         return final_bitmap
 
-    def sample_extensions(self, current_tuple_ids, join_tree, k_samples=5):
+    def sample_extensions(self, current_tuple_ids, join_tree, k_samples=5, pid_map=None, global_map=None):
         """
         [Algorithm 4 核心入口]
         
@@ -268,7 +277,7 @@ class JoinSamplingEngine:
         
         # 获取 Rj 候选 (依赖于 T)
         rj_candidates = self._get_candidates(rj_alias, rj_conds, context_data)
-        if not rj_candidates: return {}
+        if not rj_candidates: return {}, {}
         
         # 3. 计算 Rj 候选的权重
         weighted_rj = []
@@ -293,12 +302,13 @@ class JoinSamplingEngine:
                 total_weight += w
                 weighted_rj.append((cid, w))
                 
-        if total_weight == 0: return {}
+        if total_weight == 0: return {}, {}
         
         # 4. 执行 k 次采样
         # 每次采样我们都从加权后的 Rj 候选集中选一个，然后跑完剩下的树
         
         rj_extensions = defaultdict(int)
+        rj_final_bmps = defaultdict(int)
         
         for _ in range(k_samples):
             # 4.1 选 Rj
@@ -314,13 +324,20 @@ class JoinSamplingEngine:
             
             # 4.2 递归采子树
             context_data[rj_alias] = self.global_cache[rj_alias]['rows'][sel_rj]
-            rj_base_bmp = context_data[rj_alias]['_bmp']
+
+            if sel_rj not in rj_final_bmps:
+                rj_base_bmp = self._translate_pid_bitmap(
+                    context_data[rj_alias]['pid_bmp'],
+                    pid_map.get(rj_alias, {}),
+                    global_map.get(rj_alias, 0)
+                )
+                rj_final_bmps[sel_rj] = rj_base_bmp
             
             success = True
-            sample_bmp = rj_base_bmp
+            sample_bmp = rj_final_bmps[sel_rj]
             
             for child in rj_children:
-                cb = self._sample_subtree_recursive(child, context_data)
+                cb = self._sample_subtree_recursive(child, context_data, pid_map, global_map)
                 if cb is None:
                     success = False
                     break
@@ -332,4 +349,4 @@ class JoinSamplingEngine:
                 # 聚合分数
                 rj_extensions[sel_rj] |= sample_bmp
                 
-        return rj_extensions
+        return rj_extensions, rj_final_bmps

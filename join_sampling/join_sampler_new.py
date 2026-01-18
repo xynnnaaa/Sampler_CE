@@ -17,7 +17,7 @@ import sqlglot
 from sqlglot import exp
 
 # [Added] Import the Engine
-from sample_join_acyclic import JoinSamplingEngine
+from unbiased_sample_join import JoinSamplingEngine
 
 def load_qrep(fn):
     assert ".pkl" in fn
@@ -128,6 +128,9 @@ class JoinSampler:
         
         # [Added] Initialize Engine
         self.engine = JoinSamplingEngine(self.db_config)
+
+        import itertools
+        self.tie_breaker = itertools.count()
 
     def close(self):
         print("Closing database connection...")
@@ -366,11 +369,23 @@ class JoinSampler:
 
     # root选最大的表，后面的表按基数升序排列
     def build_join_tree_structure(self, join_graph, aliases):
-        def root_score(alias):
-            real_name = join_graph.nodes[alias]['real_name']
-            return (TABLE_CARD.get(real_name, float("inf")), alias)
+        aliases = sorted(aliases)
+        scored = []
+        for a in aliases:
+            real_name = join_graph.nodes[a]['real_name']
+            card = TABLE_CARD.get(real_name, float("inf"))
+            scored.append((card, a))
+        scored.sort()
 
-        root_table = max(aliases, key=root_score)
+        root_table = None
+
+        for card, alias in scored:
+            if card > 10000:
+                root_table = alias
+                break
+
+        if root_table is None or root_table == 'ci' or root_table == 'mi1' or root_table == 'mi2':
+            root_table = scored[0][1]
 
         visited = {root_table}
 
@@ -384,8 +399,8 @@ class JoinSampler:
         while len(visited) < len(aliases):
             candidates = []
 
-            for u in visited:
-                for v in join_graph.neighbors(u):
+            for u in sorted(visited):
+                for v in sorted(join_graph.neighbors(u)):
                     if v not in visited:
                         real_name = join_graph.nodes[v]['real_name']
                         card = TABLE_CARD.get(real_name, float("inf"))
@@ -398,15 +413,16 @@ class JoinSampler:
             visited.add(child)
             edge_data = join_graph.get_edge_data(parent, child)
             raw_condition = edge_data.get("join_condition")
+            norm_cond = normalize_condition(raw_condition)
 
-            if not raw_condition:
+            if not norm_cond:
                 raise ValueError(f"Missing join condition between {parent} and {child}")
             
             join_execution_plan.append({
                 'alias': child,
                 'real_name': join_graph.nodes[child]['real_name'],
                 'parent': parent,
-                'join_condition': raw_condition
+                'join_condition': norm_cond
             })
         
         if len(join_execution_plan) != len(aliases):
@@ -686,7 +702,7 @@ class JoinSampler:
                 continue
             
             row_data = root_cache[pk_str]
-            current_bmp = row_data['_bmp']
+            current_bmp = self._translate_pid_bitmap(row_data['pid_bmp'], pid_map, global_map)
 
             score = bin(current_bmp & uncovered_mask_int).count('1')
             
@@ -720,7 +736,8 @@ class JoinSampler:
         current_beam = self._initialize_root_beam(
             root_table, 
             partition_ids, 
-            None, None, # Engine handles translation now
+            template_data['pid_map'].get(root_table, {}),
+            template_data['global_map'].get(root_table, 0),
             uncovered_mask_int, 
             limit_x
         )
@@ -764,10 +781,12 @@ class JoinSampler:
                 current_ids = t_tuple['ids'] # dict {alias: pk}
                 current_base_bmp = t_tuple['bmp']
 
-                extensions = self.engine.sample_extensions(
+                extensions, rj_final_bmps = self.engine.sample_extensions(
                     current_ids, 
                     lookahead_tree, 
-                    k_samples=self.lookahead_samples
+                    k_samples=self.lookahead_samples,
+                    pid_map=template_data['pid_map'],
+                    global_map=template_data['global_map']
                 )
                 
                 if not extensions:
@@ -775,9 +794,7 @@ class JoinSampler:
 
                 # 处理扩展结果
                 for rj_id, lookahead_bmp in extensions.items():
-                    # 获取 Rj 的真实 Bitmap, 必须从 Engine 缓存拿，因为 sample_extensions 返回的是聚合过的 potential
-                    rj_row_data = self.engine.global_cache[next_alias]['rows'][rj_id]
-                    rj_real_bmp = rj_row_data['_bmp']
+                    rj_real_bmp = rj_final_bmps.get(rj_id, 0)
 
                     new_real_bmp = current_base_bmp & rj_real_bmp
 
@@ -790,7 +807,9 @@ class JoinSampler:
                     new_ids = current_ids.copy()
                     new_ids[next_alias] = rj_id
                     
-                    new_candidate = (score, new_ids, new_real_bmp)
+                    new_candidate = (score, next(self.tie_breaker), new_ids, new_real_bmp)
+
+                    # print(f"        Candidate Extension: ID={rj_id}, Score={score}")
                     
                     if len(next_candidates_heap) < limit_x:
                         heapq.heappush(next_candidates_heap, new_candidate)
@@ -804,7 +823,7 @@ class JoinSampler:
                 return None # 死路
             
             current_beam = []
-            for score, ids, real_bmp in sorted_candidates:
+            for score, counter, ids, real_bmp in sorted_candidates:
                 current_beam.append({
                     'ids': ids,
                     'bmp': real_bmp,
@@ -951,7 +970,14 @@ class JoinSampler:
 
         for template_id, template_data in self.join_templates.items():
             if len(template_data['aliases']) < 2:
-                print(f"\n=== Skipping Template: {template_id} (only {len(template_data['aliases'])} table) ===")
+                # print(f"\n=== Skipping Template: {template_id} (only {len(template_data['aliases'])} table) ===")
+                continue
+
+            if "ci" in template_data['aliases'] or "mi1" in template_data['aliases'] or "mi2" in template_data['aliases']:
+                # print(f"\n=== Skipping Template: {template_id} (contains problematic table) ===")
+                continue
+
+            if len(template_data['aliases']) < 3 or len(template_data['aliases']) >= 5:
                 continue
 
             print(f"\n=== Processing Template: {template_id} ===")
@@ -1002,7 +1028,6 @@ class JoinSampler:
         print(f"\nAll tasks finished. Results saved to directory: {self.output_path}. Total Time: {time.time() - start_time:.2f}s")
 
     def save_samples(self, samples_dict, output_path):
-        # ... (Method unchanged) ...
         formatted_output = {}
         for template_id, k_bitmaps in samples_dict.items():
             formatted_bitmaps = []
