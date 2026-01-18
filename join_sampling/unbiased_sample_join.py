@@ -39,50 +39,50 @@ class JoinSamplingEngine:
             pos = pid_bitmap_str.find('1', pos + 1)
         return result_mask
 
-    def preload_global_data(self, global_requirements, workload_name=""):
+    def preload_data(self, tables_info, template_data, workload_name=""):
         """
-        [New] 全局预加载数据
-        
-        Args:
-            global_requirements: dict, { real_table_name: set(column_names) }
-            workload_name: 用于拼接 sidecar 表名
+        加载数据 (逻辑保持不变，确保所有可能用到的连接列都建立了索引)
         """
         self.connect()
-        self.global_cache.clear()
+        self.global_cache.clear() # 根据需要决定是否清空
+        
+        # print(f"  [Engine] Preloading {len(tables_info)} tables...")
 
-        for real_name, cols_set in global_requirements.items():
-            print(f"    - Preloading table: {real_name}")
+        for t_info in tables_info:
+            print(f"    - Preloading table alias: {t_info['alias']}")
+            alias = t_info['alias']
+            if alias in self.global_cache: continue 
 
-            sorted_cols = sorted(list(cols_set))
-            if 'id' in sorted_cols:
-                sorted_cols.remove('id')
-                sorted_cols.insert(0, 'id')
-            elif 'Id' in sorted_cols: # 兼容某些可能的大写 Id
-                sorted_cols.remove('Id')
-                sorted_cols.insert(0, 'Id')
-
+            real_name = t_info['real_name']
+            join_keys = t_info['join_keys']
+            
             sidecar_name = f"{real_name}_anno_idx_{workload_name}" if workload_name else f"{real_name}_anno_idx"
-            cols_str = ", ".join([f"t.{c}" for c in sorted_cols])
+
+            cols_str = ", ".join([f"t.{c}" for c in join_keys])
+
+            time_start = time.time()
+
             sql = f"""
                 SELECT {cols_str}, s.query_anno::text
                 FROM {real_name} t
                 JOIN {sidecar_name} s ON t.id = s.query_anno_id
             """
-            time_start = time.time()
             self.cursor.execute(sql)
             rows = self.cursor.fetchall()
-            print(f"      Loaded {len(rows)} rows from {real_name} in {time.time() - time_start:.2f}s")
 
+            print(f"      Loaded {len(rows)} rows from {real_name} in {time.time() - time_start:.2f}s")
+            
             row_map = {}
             indexes = defaultdict(lambda: defaultdict(list))
-            col_name_to_idx = {name: i for i, name in enumerate(sorted_cols)}
+            col_name_to_idx = {name: i for i, name in enumerate(join_keys)}
             id_idx = col_name_to_idx['id']
 
-            time_process_start = time.time()
+            time_start = time.time()
 
             for i, r in enumerate(rows):
                 pk_id = str(r[id_idx])
                 raw_bitmap = r[-1]
+                # qid_mask = self._translate_pid_bitmap(raw_bitmap, my_pid_map, my_global_mask)
                 
                 row_data = {'pid_bmp': raw_bitmap}
                 for col, idx in col_name_to_idx.items():
@@ -93,67 +93,14 @@ class JoinSamplingEngine:
                 row_map[pk_id] = row_data
 
                 if (i + 1) % 1000000 == 0:
-                    print(f"        Processed {i + 1} rows in {time.time() - time_process_start:.2f}s")
-                    time_process_start = time.time()
-
-            self.global_cache[real_name] = {
+                    print(f"        Processed {i + 1} rows in {time.time() - time_start:.2f}s")
+                    time_start = time.time()
+            
+            self.global_cache[alias] = {
                 'rows': row_map,
-                'indexes': indexes
+                'indexes': indexes,
+                'real_name': real_name
             }
-        
-        # for t_info in tables_info:
-        #     real_name = t_info['real_name']
-        #     print(f"    - Preloading real table: {real_name}")
-        #     if real_name in self.global_cache: continue 
-
-        #     real_name = t_info['real_name']
-        #     join_keys = t_info['join_keys']
-            
-        #     sidecar_name = f"{real_name}_anno_idx_{workload_name}" if workload_name else f"{real_name}_anno_idx"
-
-        #     cols_str = ", ".join([f"t.{c}" for c in join_keys])
-
-        #     time_start = time.time()
-
-        #     sql = f"""
-        #         SELECT {cols_str}, s.query_anno::text
-        #         FROM {real_name} t
-        #         JOIN {sidecar_name} s ON t.id = s.query_anno_id
-        #     """
-        #     self.cursor.execute(sql)
-        #     rows = self.cursor.fetchall()
-
-        #     print(f"      Loaded {len(rows)} rows from {real_name} in {time.time() - time_start:.2f}s")
-            
-        #     row_map = {}
-        #     indexes = defaultdict(lambda: defaultdict(list))
-        #     col_name_to_idx = {name: i for i, name in enumerate(join_keys)}
-        #     id_idx = col_name_to_idx['id']
-
-        #     time_start = time.time()
-
-        #     for i, r in enumerate(rows):
-        #         pk_id = str(r[id_idx])
-        #         raw_bitmap = r[-1]
-        #         # qid_mask = self._translate_pid_bitmap(raw_bitmap, my_pid_map, my_global_mask)
-                
-        #         row_data = {'pid_bmp': raw_bitmap}
-        #         for col, idx in col_name_to_idx.items():
-        #             val = str(r[idx])
-        #             row_data[col] = val
-        #             indexes[col][val].append(pk_id)
-                
-        #         row_map[pk_id] = row_data
-
-        #         if (i + 1) % 1000000 == 0:
-        #             print(f"        Processed {i + 1} rows in {time.time() - time_start:.2f}s")
-        #             time_start = time.time()
-            
-        #     self.global_cache[alias] = {
-        #         'rows': row_map,
-        #         'indexes': indexes,
-        #         'real_name': real_name
-        #     }
 
     def _get_candidates(self, alias, conds, context_data):
         """

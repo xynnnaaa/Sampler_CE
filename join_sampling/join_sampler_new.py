@@ -683,18 +683,18 @@ class JoinSampler:
 
 
 # 辅助函数：将 Partition ID 转化为初始的 T (Beam)
-    def _initialize_root_beam(self, root_alias, root_real_name, partition_ids, pid_map, global_map, uncovered_mask_int, limit_x):
+    def _initialize_root_beam(self, root_alias, partition_ids, pid_map, global_map, uncovered_mask_int, limit_x):
         """
         从 Partition IDs 构建初始的 Beam (T)。
         完全在内存中进行，不查数据库。
         """
         candidates = []
         
-        if root_real_name not in self.engine.global_cache:
-            print(f"Error: Root table {root_real_name} not loaded in Engine.")
+        if root_alias not in self.engine.global_cache:
+            print(f"Error: Root table {root_alias} not loaded in Engine.")
             return []
             
-        root_cache = self.engine.global_cache[root_real_name]['rows']
+        root_cache = self.engine.global_cache[root_alias]['rows']
         
         for pid in partition_ids:
             pk_str = str(pid)
@@ -734,8 +734,7 @@ class JoinSampler:
 
         # Root Beam (Step 0)
         current_beam = self._initialize_root_beam(
-            root_table,
-            join_graph.nodes[root_table]['real_name'],
+            root_table, 
             partition_ids, 
             template_data['pid_map'].get(root_table, {}),
             template_data['global_map'].get(root_table, 0),
@@ -881,36 +880,36 @@ class JoinSampler:
         template_data['pid_map'] = pid_map
         template_data['global_map'] = global_map
 
-        # # === Preload Data into Engine ===
-        # engine_tables_info = []
-        # # 加载所有涉及的表，因为 Engine 现在负责所有的 Join
-        # for node, info in join_graph.nodes(data=True):
-        #     raw_sels = info["sels"]
-        #     clean_cols = set()
-        #     for s in raw_sels:
-        #         col = s.split('.')[-1]
-        #         clean_cols.add(col)
+        # === Preload Data into Engine ===
+        engine_tables_info = []
+        # 加载所有涉及的表，因为 Engine 现在负责所有的 Join
+        for node, info in join_graph.nodes(data=True):
+            raw_sels = info["sels"]
+            clean_cols = set()
+            for s in raw_sels:
+                col = s.split('.')[-1]
+                clean_cols.add(col)
 
-        #     if "id" in clean_cols:
-        #         clean_cols.remove("id")
-        #         final_cols_list = ["id"] + sorted(list(clean_cols))
-        #     elif "Id" in clean_cols:
-        #         clean_cols.remove("Id")
-        #         final_cols_list = ["Id"] + sorted(list(clean_cols))
-        #     else:
-        #         final_cols_list = ["id"] + sorted(list(clean_cols))
+            if "id" in clean_cols:
+                clean_cols.remove("id")
+                final_cols_list = ["id"] + sorted(list(clean_cols))
+            elif "Id" in clean_cols:
+                clean_cols.remove("Id")
+                final_cols_list = ["Id"] + sorted(list(clean_cols))
+            else:
+                final_cols_list = ["id"] + sorted(list(clean_cols))
 
-        #     engine_tables_info.append({
-        #         'alias': node,
-        #         'real_name': template_data['real_names'][node],
-        #         'join_keys': final_cols_list
-        #     })
+            engine_tables_info.append({
+                'alias': node,
+                'real_name': template_data['real_names'][node],
+                'join_keys': final_cols_list
+            })
         
-        # # Preload 自动处理 Translation 和 Indexing
-        # preload_start_time = time.time()
-        # print(f"    --> Preloading data into Engine...")
-        # self.engine.preload_data(engine_tables_info, template_data, self.workload_name)
-        # print(f"        Preloading completed in {time.time() - preload_start_time:.2f}s.")
+        # Preload 自动处理 Translation 和 Indexing
+        preload_start_time = time.time()
+        print(f"    --> Preloading data into Engine...")
+        self.engine.preload_data(engine_tables_info, template_data, self.workload_name)
+        print(f"        Preloading completed in {time.time() - preload_start_time:.2f}s.")
         
         for k in range(self.k_bitmaps):
             bitmap_start_time = time.time()
@@ -963,49 +962,6 @@ class JoinSampler:
         if not os.path.exists(self.output_path):
             os.makedirs(self.output_path)
             print(f"Created output directory: {self.output_path}")
-
-        print("Collecting global table requirements...")
-        # 结构: { real_name: set(columns) }
-        global_requirements = defaultdict(set)
-
-        for template_id, template_data in self.join_templates.items():
-            join_graph = template_data['join_graph']
-            aliases = template_data['aliases']
-            real_names = template_data['real_names']
-
-            for node, info in join_graph.nodes(data=True):
-                sels = []
-                edges = join_graph.edges(node)
-                for edge in edges:
-                    edge_data = join_graph[edge[0]][edge[1]]
-                    if "!" in edge_data["join_condition"]:
-                        jconds = edge_data["join_condition"].split("!=")
-                    else:
-                        jconds = edge_data["join_condition"].split("=")
-                    for jc in jconds:
-                        jc = jc.strip()
-                        if node == jc[0:len(node)]:
-                            if jc not in sels:
-                                sels.append(jc)
-                        jc_node = jc.split(".")[0]
-                        join_graph[edge[0]][edge[1]][jc_node] = jc
-                
-                # 如果没有主键就加上主键
-                if f"{node}.id" not in sels and f"{node}.Id" not in sels:
-                    sels.append(f"{node}.id")
-                
-                join_graph.nodes()[node]["sels"] = sels
-
-                for sel in sels:
-                    col = sel.split('.')[-1]
-                    real_name = real_names[node]
-                    global_requirements[real_name].add(col)
-
-            template_data['join_graph'] = join_graph
-
-        print(f"Global Preload: Loading {len(global_requirements)} unique real tables into Engine...")
-        self.engine.preload_global_data(global_requirements, self.workload_name)
-
 
         SAVE_BATCH_SIZE = 10
         current_batch_samples = {}
