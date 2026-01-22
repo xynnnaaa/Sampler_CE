@@ -13,6 +13,7 @@ from query_representation.utils import *
 
 import pdb
 
+
 def to_variable(arr, use_cuda=True, requires_grad=False):
     if isinstance(arr, list) or isinstance(arr, tuple):
         arr = np.array(arr)
@@ -437,7 +438,7 @@ class QueryDataset(data.Dataset):
 
             # 新增过滤条件：检查 join embedding 是否有效
             if not is_valid_join_embedding(qrep["name"], node,
-                    self.join_embeddings):
+                    self.join_embeddings, qrep["join_graph"]):
                 continue
 
             x,y = self.featurizer.get_subplan_features(qrep,

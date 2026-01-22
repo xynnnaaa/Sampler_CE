@@ -1,7 +1,3 @@
-# anno列存谓词id
-# 从小表开始，因为只会对第一个表扫描一遍做映射，单表可以直接用单表采样的方法
-# 在内存中做映射，把M的内容select出来到内存里，在内存做映射和排序，然后直接把排好的作为T插回去
-
 import pickle
 import glob
 import os
@@ -20,6 +16,9 @@ import heapq
 import sqlglot
 from sqlglot import exp
 
+# [Added] Import the Engine
+from Sampler.join_sampling.v2_unbiased.unbiased_sample_join import JoinSamplingEngine
+
 def load_qrep(fn):
     assert ".pkl" in fn
     with open(fn, "rb") as f:
@@ -32,10 +31,6 @@ def load_qrep(fn):
     return query
 
 def normalize_condition(cond_str):
-    """
-    标准化连接条件字符串，确保 'a=b' 和 'b=a' 被视为相同。
-    去掉空格并按字典序排列等号两边。
-    """
     if not cond_str:
         return "None"
     parts = [p.strip() for p in cond_str.split('=')]
@@ -86,6 +81,10 @@ class JoinSampler:
         self.k_bitmaps = samp_conf.get("k_bitmaps", 5)
         self.limit_x = samp_conf.get("limit_x", 50)
         self.batch_size = samp_conf.get("batch_size", 1000)
+        
+        # [Added] Lookahead configuration
+        self.lookahead_k = samp_conf.get("lookahead_k", 5) # 向后看几步
+        self.lookahead_samples = samp_conf.get("lookahead_samples", 500) # 采样次数
 
         print("Configuration Loaded:")
         print(f"  Base Query Directory: {self.base_query_dir}")
@@ -95,19 +94,22 @@ class JoinSampler:
         print(f"  M Partitions: {self.m_partitions}")
         print(f"  K Bitmaps: {self.k_bitmaps}")
         print(f"  Limit X: {self.limit_x}")
+        print(f"  Lookahead K: {self.lookahead_k}")
 
         self.join_templates = {}
-        self.global_predicate_map = defaultdict(lambda: {}) # {real_table: {pred_sql: pid}}
-        self.global_pid_counters = defaultdict(int)         # {real_table: next_pid}
+        self.global_predicate_map = defaultdict(lambda: {}) 
+        self.global_pid_counters = defaultdict(int)         
 
         db_conf = self.config.get("database", {})
+        self.db_config = {
+            "host": db_conf.get("host", "localhost"),
+            "port": db_conf.get("port", 5432),
+            "dbname": db_conf.get("dbname", "imdb"),
+            "user": db_conf.get("user", "your_username")
+        }
+
         try:
-            self.conn = psycopg2.connect(
-                host=db_conf.get("host", "localhost"),
-                port=db_conf.get("port", 5432),
-                dbname=db_conf.get("dbname", "imdb"),
-                user=db_conf.get("user", "your_username")
-            )
+            self.conn = psycopg2.connect(**self.db_config)
             self.cursor = self.conn.cursor()
             self.cursor.execute("""
                 CREATE TEMP TABLE IF NOT EXISTS temp_partition_filter (
@@ -124,12 +126,21 @@ class JoinSampler:
             print(f"Error connecting to database: {e}")
             raise e
         
+        # [Added] Initialize Engine
+        self.engine = JoinSamplingEngine(self.db_config)
+
+        import itertools
+        self.tie_breaker = itertools.count()
+
     def close(self):
         print("Closing database connection...")
         if hasattr(self, 'cursor') and self.cursor:
             self.cursor.close()
         if hasattr(self, 'conn') and self.conn:
             self.conn.close()
+        # [Added] Close Engine
+        if self.engine:
+            self.engine.close()
         print("Resources released.")
 
     def _remove_alias_safe(self, pred_sql, alias):
@@ -287,7 +298,7 @@ class JoinSampler:
             }
 
         # 将join_templates按照alias个数升序排列
-        self.join_templates = dict(sorted(self.join_templates.items(), key=lambda item: len(item[1]['aliases'])))
+        # self.join_templates = dict(sorted(self.join_templates.items(), key=lambda item: len(item[1]['aliases'])))
 
 
     def prepare_pid_to_qid_map(self, template_data):
@@ -356,13 +367,24 @@ class JoinSampler:
         pass
 
 
-    # root选最大的表，后面的表按基数升序排列
     def build_join_tree_structure(self, join_graph, aliases):
-        def root_score(alias):
-            real_name = join_graph.nodes[alias]['real_name']
-            return (TABLE_CARD.get(real_name, float("inf")), alias)
+        aliases = sorted(aliases)
+        scored = []
+        for a in aliases:
+            real_name = join_graph.nodes[a]['real_name']
+            card = TABLE_CARD.get(real_name, float("inf"))
+            scored.append((card, a))
+        scored.sort()
 
-        root_table = max(aliases, key=root_score)
+        root_table = None
+
+        for card, alias in scored:
+            if card > 10000:
+                root_table = alias
+                break
+
+        if root_table is None or root_table == 'ci' or root_table == 'mi1' or root_table == 'mi2':
+            root_table = scored[0][1]
 
         visited = {root_table}
 
@@ -376,8 +398,8 @@ class JoinSampler:
         while len(visited) < len(aliases):
             candidates = []
 
-            for u in visited:
-                for v in join_graph.neighbors(u):
+            for u in sorted(visited):
+                for v in sorted(join_graph.neighbors(u)):
                     if v not in visited:
                         real_name = join_graph.nodes[v]['real_name']
                         card = TABLE_CARD.get(real_name, float("inf"))
@@ -390,38 +412,17 @@ class JoinSampler:
             visited.add(child)
             edge_data = join_graph.get_edge_data(parent, child)
             raw_condition = edge_data.get("join_condition")
+            norm_cond = normalize_condition(raw_condition)
 
-            if not raw_condition:
+            if not norm_cond:
                 raise ValueError(f"Missing join condition between {parent} and {child}")
             
             join_execution_plan.append({
                 'alias': child,
                 'real_name': join_graph.nodes[child]['real_name'],
                 'parent': parent,
-                'join_condition': raw_condition
+                'join_condition': norm_cond
             })
-
-            # neighbors = list(join_graph.neighbors(current_node))
-            # neighbors.sort()
-
-            # for neighbor in neighbors:
-            #     if neighbor not in visited:
-            #         visited.add(neighbor)
-            #         queue.append(neighbor)
-
-            #         # check
-            #         edge_data = join_graph.get_edge_data(current_node, neighbor)
-            #         raw_condition = edge_data.get("join_condition")
-
-            #         if not raw_condition:
-            #             raise ValueError(f"Missing join condition between {current_node} and {neighbor}")
-                    
-            #         join_execution_plan.append({
-            #             'alias': neighbor,
-            #             'real_name': join_graph.nodes[neighbor]['real_name'],
-            #             'parent': current_node,
-            #             'join_condition': raw_condition
-            #         })
         
         if len(join_execution_plan) != len(aliases):
             print(f"WARNING: Subgraph might be disconnected. Expected {len(aliases)} nodes, got {len(join_execution_plan)}.")
@@ -583,303 +584,267 @@ class JoinSampler:
             
         print(f"    [Sidecar Setup] Finished. Total time: {time.time() - start_total:.2f}s", flush=True)
 
-
-    def greedy_join_selection(self, partition_ids, partition_idx, root_cache, root_table, join_tree, template_data, global_covered_mask, limit_x):
+    def _parse_join_condition_for_engine(self, raw_cond, child_alias, parent_alias):
         """
-        Algorithm 4
+        辅助函数：解析 SQL 连接条件，提取 (my_col, target_alias, target_col)。
+        用于 Engine 的 get_candidates。
+        """
+        # raw_cond的结构例如 "t.id = mi.movie_id"
+        parts = raw_cond.split('=')
+        if len(parts) != 2: return []
+        
+        left = parts[0].strip().split('.')
+        right = parts[1].strip().split('.')
+        
+        child_col = None
+        target_col = None
+        target_alias_res = None
+        
+        if left[0] == child_alias:
+            child_col = left[1]
+            if right[0] == parent_alias:
+                target_col = right[1]
+                target_alias_res = right[0]
+        elif right[0] == child_alias:
+            child_col = right[1]
+            if left[0] == parent_alias:
+                target_col = left[1]
+                target_alias_res = left[0]
+                
+        if child_col and target_col:
+            return [(child_col, target_alias_res, target_col)]
+        return []
+
+    def _build_lookahead_forest(self, join_execution_plan, start_index, k_steps):
+        """
+        基于 join_execution_plan 构建 Lookahead Tree。
+        
+        Args:
+            join_execution_plan: 完整的执行计划列表
+            start_index: 当前 Rj 在 plan 中的下标
+            k_steps: 向后看多少步 (不包括 Rj 自己)
+        
+        Returns:
+            list: [tree_root_structure] (通常只有一个元素，因为 Rj 是唯一的根)
+        """
+        # 截取 Rj 及其后面的 K 个表
+        lookahead_slice = join_execution_plan[start_index : start_index + k_steps + 1]
+        
+        if not lookahead_slice:
+            return []
+            
+        # 初始化 Rj 是根
+        rj_node_data = lookahead_slice[0]
+        rj_alias = rj_node_data['alias']
+        
+        # 这里的 conds 是 Rj 连向 T 的条件，得到(rj_col, parent_alias, parent_col)
+        rj_conds = self._parse_join_condition_for_engine(
+            rj_node_data['join_condition'], 
+            rj_alias, 
+            rj_node_data['parent']
+        )
+
+        # key: alias, value: node_structure (dict)
+        tree_nodes = {}
+        
+        root_struct = {
+            'alias': rj_alias,
+            'conds': rj_conds,
+            'children': []
+        }
+        tree_nodes[rj_alias] = root_struct
+        
+        # 线性遍历后续表，尝试挂载
+        for step in lookahead_slice[1:]:
+            child_alias = step['alias']
+            parent_alias = step['parent']
+            raw_cond = step['join_condition']
+            
+            # 只有当 Parent 已经在树中时，才挂载
+            if parent_alias in tree_nodes:
+                conds = self._parse_join_condition_for_engine(raw_cond, child_alias, parent_alias)
+                
+                child_struct = {
+                    'alias': child_alias,
+                    'conds': conds,
+                    'children': []
+                }
+                
+                tree_nodes[parent_alias]['children'].append(child_struct)
+                
+                tree_nodes[child_alias] = child_struct
+            else:
+                # Parent 不在树中 (说明直接连 T 的更早节点)，跳过 
+                pass
+                
+        # 返回根节点
+        return [root_struct]
+
+
+# 辅助函数：将 Partition ID 转化为初始的 T (Beam)
+    def _initialize_root_beam(self, root_alias, partition_ids, pid_map, global_map, uncovered_mask_int, limit_x):
+        """
+        从 Partition IDs 构建初始的 Beam (T)。
+        完全在内存中进行，不查数据库。
+        """
+        candidates = []
+        
+        if root_alias not in self.engine.global_cache:
+            print(f"Error: Root table {root_alias} not loaded in Engine.")
+            return []
+            
+        root_cache = self.engine.global_cache[root_alias]['rows']
+        
+        for pid in partition_ids:
+            pk_str = str(pid)
+            if pk_str not in root_cache:
+                continue
+            
+            row_data = root_cache[pk_str]
+            current_bmp = self._translate_pid_bitmap(row_data['pid_bmp'], pid_map, global_map)
+
+            score = bin(current_bmp & uncovered_mask_int).count('1')
+            
+            candidate = {
+                'ids': {root_alias: pk_str},
+                'bmp': current_bmp,
+                'score': score # 仅用于排序
+            }
+            candidates.append(candidate)
+            
+        # 初始筛选 Top-K
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        return candidates[:limit_x]
+
+    def greedy_join_selection(self, partition_ids, partition_idx, root_table, join_tree, template_data, global_covered_mask, limit_x):
+        """
+        Algorithm 4: Pure Memory Version
+        完全移除 SQL Join，逻辑由 Engine 和 Python 接管。
         """
         join_graph = template_data['join_graph']
         total_queries = template_data['queries_count']
-
-        pid_map = template_data.get('pid_map', {})
-        global_map = template_data.get('global_map', {})
-
+        
+        # 计算 Uncovered Mask
         all_query_ids = set(range(total_queries))
         uncovered_ids = list(all_query_ids - global_covered_mask)
         uncovered_mask_int = 0
         for qid in uncovered_ids:
             uncovered_mask_int |= (1 << qid)
 
-        try:
-            root_real_name = template_data['real_names'][root_table]
-            if self.workload_name:
-                temp_T_name = "temp_T_" + self.workload_name
-                temp_T_new_name = "temp_T_new_" + self.workload_name
-                root_sidecar = f"{root_real_name}_anno_idx_{self.workload_name}"
-            else:
-                temp_T_name = "temp_T"
-                temp_T_new_name = "temp_T_new"
-                root_sidecar = f"{root_real_name}_anno_idx"
-            self.cursor.execute(f"DROP TABLE IF EXISTS {temp_T_name};")
-
-            if not partition_ids: return None
-
-            current_id_cols = []
-
-            root_sels = join_graph.nodes[root_table]['sels']
-
-            root_cols = []
-            id_idx = -1
-            for i, sel in enumerate(root_sels):
-                # 在视图中的列重命名为 Alias_Column 形式
-                col_pure = sel.split('.')[-1] 
-                if col_pure == "id" or col_pure == "Id":
-                    id_idx = i
-                root_cols.append(f"{col_pure} AS {root_table}_{col_pure}")
-                current_id_cols.append(f"{root_table}_{col_pure}")
-
-            if id_idx == -1:
-                print(f"        Warning: can't find id column for table {root_table}.")
-                return None
-
-            root_select_str = ", ".join(root_cols)
-
-            cached_pairs = None
-            if root_cache is not None and partition_idx in root_cache:
-                print(f"            Load id->qid map from cache.")
-                cached_pairs = root_cache[partition_idx]
-            else:
-                print(f"            Compute id->qid map.")
-
-                self.cursor.execute("TRUNCATE temp_partition_filter")
-                buf = io.StringIO()
-                for pid in partition_ids:
-                    buf.write(f"{pid}\n")
-                buf.seek(0)
-                self.cursor.copy_from(
-                    buf,
-                    "temp_partition_filter",
-                    columns=("pid",),
-                )
-                # ids_values = ",".join(f"({uid})" for uid in partition_ids)
-                # fetch_sql = f"""
-                #     WITH partition_filter(pid) AS ( VALUES {ids_values} )
-                #     SELECT t.query_anno_id, t.query_anno::text
-                #     FROM {root_sidecar} t
-                #     JOIN partition_filter pf ON t.query_anno_id = pf.pid
-                # """
-                fetch_sql = f"""
-                    SELECT t.query_anno_id, t.query_anno::text
-                    FROM {root_sidecar} t
-                    JOIN temp_partition_filter pf
-                    ON t.query_anno_id = pf.pid;
-                """
-                t1_execute = time.time()
-                self.cursor.execute(fetch_sql)
-                print(f"                Execute root table select query in {time.time() - t1_execute:.2f}s.")
-                t1_fetchall = time.time()
-                rows = self.cursor.fetchall()
-                print(f"                Fetched {len(rows)} rows from root table '{root_real_name}' in {time.time() - t1_fetchall:.2f}s.")
-
-                cached_pairs = []
-                r_map = pid_map.get(root_table, {})
-                r_global = global_map.get(root_table, 0)
-
-                t2 = time.time()
-                for row in rows:
-                    pk_id = row[0]
-                    anno_str = row[-1]
-                    qid_mask = self._translate_pid_bitmap(anno_str, r_map, r_global)
-                    cached_pairs.append((pk_id, qid_mask))
-                print(f"                Translated PID to QID in {time.time() - t2:.2f}s.")
-
-                if root_cache is not None:
-                    root_cache[partition_idx] = cached_pairs
-
-            scored_candidates = []
-            for pk_id, qid_mask in cached_pairs:
-                score = bin(qid_mask & uncovered_mask_int).count('1')
-                scored_candidates.append((score, pk_id, qid_mask))
-            scored_candidates.sort(key=lambda x: x[0], reverse=True)
-            top_k = scored_candidates[:limit_x]
-
-            if not top_k:
-                return None
-            
-            top_ids = [item[1] for item in top_k]
-            top_ids_str = ",".join(map(str, top_ids))
-
-            id_to_mask = {item[1]: item[2] for item in top_k}
-
-            refetch_sql = f"""
-                SELECT {root_select_str}
-                FROM {root_real_name} AS {root_table}
-                WHERE {root_table}.id IN ({top_ids_str})
-            """
-            t_refetch = time.time()
-            self.cursor.execute(refetch_sql)
-            rows = self.cursor.fetchall()
-            print(f"            Refetched {len(rows)} rows from root table '{root_real_name}' in {time.time() - t_refetch:.2f}s.")
-            
-            # check
-            dummy_anno = f"B'{'0'*total_queries}'::bit varying({total_queries})"
-
-            create_sql = f"""
-                CREATE TEMP TABLE {temp_T_name} AS
-                SELECT {root_select_str}, {dummy_anno} AS anno
-                FROM {root_real_name} AS {root_table}
-                LIMIT 0
-            """
-            t3 = time.time()
-            self.cursor.execute(create_sql)
-            print(f"            Created temp table '{temp_T_name}' in {time.time() - t3:.2f}s.")
-
-            insert_values = []
-
-            for row in rows:
-                id_val = row[id_idx]
-                qid_str = format(id_to_mask[id_val], f'0{total_queries}b')
-                insert_values.append(tuple(list(row) + [qid_str]))
-
-            insert_sql = f"INSERT INTO {temp_T_name} VALUES %s"
-            t4 = time.time()
-            execute_values(self.cursor, insert_sql, insert_values)
-            print(f"            Inserted top-{len(top_k)} candidates into '{temp_T_name}' in {time.time() - t4:.2f}s.")
-
-            for step in join_tree[1:]:
-                next_alias = step['alias']
-                real_name = step['real_name']
-                if self.workload_name:
-                    next_sidecar = f"{real_name}_anno_idx_{self.workload_name}"
-                else:
-                    next_sidecar = f"{real_name}_anno_idx"
-
-                parent_alias = step['parent']
-                raw_join_cond = step['join_condition'] # e.g., "t.id = mi.movie_id"
-
-                prev_cols_sql = [f"T_tmp.{col}" for col in current_id_cols]
-                prev_select_str = ", ".join(prev_cols_sql)
-
-                next_sels = join_graph.nodes[next_alias]['sels']
-                next_cols_sql = []
-                for sel in next_sels:
-                    col_pure = sel.split('.')[-1]
-                    next_cols_sql.append(f"{next_alias}.{col_pure} AS {next_alias}_{col_pure}")
-                    current_id_cols.append(f"{next_alias}_{col_pure}")
-
-                next_select_str = ", ".join(next_cols_sql)
-
-                pattern = fr"\b{parent_alias}\."
-                replacement = f"T_tmp.{parent_alias}_"
-                fixed_join_cond = re.sub(pattern, replacement, raw_join_cond)
-
-                fetch_join_sql = f"""
-                    SELECT
-                        {prev_select_str},
-                        {next_select_str},
-                        sa.query_anno::text,
-                        T_tmp.anno::text
-                    FROM {temp_T_name} T_tmp
-                    JOIN {real_name} AS {next_alias} ON {fixed_join_cond}
-                    JOIN {next_sidecar} sa ON {next_alias}.id = sa.query_anno_id;
-                """
-                t5_execute = time.time()
-                self.cursor.execute("SET enable_hashjoin = OFF;")
-                self.cursor.execute("SET enable_mergejoin = OFF;")
-                self.cursor.execute(fetch_join_sql)
-                print(f"                Execute {next_alias} join select query in {time.time() - t5_execute:.2f}s.")
-                t5_fetchall = time.time()
-                rows = self.cursor.fetchall()
-                print(f"                Fetched joined rows with '{next_alias}' in {time.time() - t5_fetchall:.2f}s. Total rows: {len(rows)}")
-
-                self.cursor.execute("SET enable_hashjoin = ON;")
-                self.cursor.execute("SET enable_mergejoin = ON;")
-
-                scored_candidates = []
-                n_map = pid_map.get(next_alias, {})
-                n_global = global_map.get(next_alias, 0)
-
-                # TODO: 这里内存占用很大，可以不要append了，改成维护一个limit_x大小的有序数组？
-
-                t6 = time.time()
-                top_k_heap = []
-                for row in rows:
-                    t_qid_str = row[-1]
-                    n_pid_str = row[-2]
-                    row_data = row[:-2]
-                    n_qid_mask = self._translate_pid_bitmap(n_pid_str, n_map, n_global)
-                    new_anno_mask = n_qid_mask & int(t_qid_str, 2)
-                    score = bin(new_anno_mask & uncovered_mask_int).count('1')
-                    item = (score, row_data, new_anno_mask)
-                    if len(top_k_heap) < limit_x:
-                        heapq.heappush(top_k_heap, item)
-                    else:
-                        if score > top_k_heap[0][0]:
-                            heapq.heapreplace(top_k_heap, item)
-
-                top_k = sorted(top_k_heap, key=lambda x: x[0], reverse=True)
-                print(f"            Processed and scored joined rows in {time.time() - t6:.2f}s.")
-
-                if not top_k:
-                    return None
-                
-                # 如果已经是最后一步，直接返回best_tuple
-                if step == join_tree[-1]:
-                    best_score, best_row_data, best_qid_mask = top_k[0]
-                    full_row_ids = {}
-                    for i, col_name in enumerate(current_id_cols):
-                        if col_name.endswith("_id") or col_name.endswith("_Id"):
-                            for alias in join_graph.nodes:
-                                if col_name == f"{alias}_id" or col_name == f"{alias}_Id":
-                                    full_row_ids[alias] = best_row_data[i]
-                                    break
-                    for alias in join_graph.nodes:
-                        if alias not in full_row_ids:
-                            print(f"            Warning: ID for alias '{alias}' not found in selected row.")
-                            return None
-                    covered_indices = set()
-                    temp_mask = best_qid_mask
-                    qid = 0
-                    while temp_mask > 0:
-                        if temp_mask & 1:
-                            covered_indices.add(qid)
-                        temp_mask >>= 1
-                        qid += 1
-                    return {
-                        'full_row': full_row_ids,
-                        'covered_indices': covered_indices
-                    }
-
-                create_sql = f"""
-                    CREATE TEMP TABLE {temp_T_new_name} AS
-                    SELECT
-                        {prev_select_str},
-                        {next_select_str},
-                        {dummy_anno} AS anno
-                    FROM {temp_T_name} T_tmp
-                    JOIN {real_name} AS {next_alias}
-                    ON {fixed_join_cond}
-                    LIMIT 0;
-                """
-                t7 = time.time()
-                self.cursor.execute(create_sql)
-                self.cursor.execute(f"DROP TABLE IF EXISTS {temp_T_name};")
-                self.cursor.execute(f"ALTER TABLE {temp_T_new_name} RENAME TO {temp_T_name};")
-                print(f"            Created new temp table '{temp_T_name}' after joining '{next_alias}' in {time.time() - t7:.2f}s.")
-
-                insert_values = []
-                for score, row_data, anno_mask in top_k:
-                    anno_str = format(anno_mask, f'0{total_queries}b')
-                    insert_values.append(tuple(list(row_data) + [anno_str]))
-                insert_sql = f"INSERT INTO {temp_T_name} VALUES %s"
-                t8 = time.time()
-                execute_values(self.cursor, insert_sql, insert_values)
-                print(f"            Inserted top-{len(top_k)} candidates into '{temp_T_name}' after joining '{next_alias}' in {time.time() - t8:.2f}s.")
+        # Root Beam (Step 0)
+        current_beam = self._initialize_root_beam(
+            root_table, 
+            partition_ids, 
+            template_data['pid_map'].get(root_table, {}),
+            template_data['global_map'].get(root_table, 0),
+            uncovered_mask_int, 
+            limit_x
+        )
         
-        except Exception as e:
-            self.conn.rollback()
-            print(f"Error during greedy join selection: {e}")
+        if not current_beam:
             return None
-        finally:
-            self.cursor.execute(f"DROP TABLE IF EXISTS {temp_T_name};")
+
+        # Step 1 to N
+        # join_tree[0] 是 root, 循环从 1 开始
+        for step_idx, step in enumerate(join_tree[1:]):
+            next_alias = step['alias']
+            
+            # 构建 Lookahead Tree
+            current_plan_idx = step_idx + 1
+            
+            lookahead_tree_list = self._build_lookahead_forest(
+                join_tree, 
+                current_plan_idx, 
+                self.lookahead_k
+            )
+            
+            lookahead_tree = lookahead_tree_list[0] if lookahead_tree_list else None
+            
+            if not lookahead_tree:
+                # 不应该发生
+                print(f"Warning: Lookahead tree empty at step {step_idx} for alias {next_alias}. Using single node.")
+                lookahead_tree = {
+                    'alias': next_alias, 
+                    'conds': self._parse_join_condition_for_engine(
+                        step['join_condition'], next_alias, step['parent']
+                    ),
+                    'children': []
+                }
+
+            # 扩展 Beam 中的每一个元组
+            next_candidates_heap = [] # Min-heap for Top-K
+
+            self.engine.memo.clear() # 清空权重缓存
+            
+            for t_tuple in current_beam:
+                current_ids = t_tuple['ids'] # dict {alias: pk}
+                current_base_bmp = t_tuple['bmp']
+
+                extensions, rj_final_bmps = self.engine.sample_extensions(
+                    current_ids, 
+                    lookahead_tree, 
+                    k_samples=self.lookahead_samples,
+                    pid_map=template_data['pid_map'],
+                    global_map=template_data['global_map']
+                )
+                
+                if not extensions:
+                    continue
+
+                # 处理扩展结果
+                for rj_id, lookahead_bmp in extensions.items():
+                    rj_real_bmp = rj_final_bmps.get(rj_id, 0)
+
+                    new_real_bmp = current_base_bmp & rj_real_bmp
+
+                    # CHECK: 打分逻辑还要再确认
+                    final_potential_bmp = current_base_bmp & lookahead_bmp
+                    
+                    score = bin(final_potential_bmp & uncovered_mask_int).count('1')
+                    
+                    # 构建新元组
+                    new_ids = current_ids.copy()
+                    new_ids[next_alias] = rj_id
+                    
+                    new_candidate = (score, next(self.tie_breaker), new_ids, new_real_bmp)
+
+                    # print(f"        Candidate Extension: ID={rj_id}, Score={score}")
+                    
+                    if len(next_candidates_heap) < limit_x:
+                        heapq.heappush(next_candidates_heap, new_candidate)
+                    else:
+                        if score > next_candidates_heap[0][0]:
+                            heapq.heapreplace(next_candidates_heap, new_candidate)
+            
+            sorted_candidates = sorted(next_candidates_heap, key=lambda x: x[0], reverse=True)
+            
+            if not sorted_candidates:
+                return None # 死路
+            
+            current_beam = []
+            for score, counter, ids, real_bmp in sorted_candidates:
+                current_beam.append({
+                    'ids': ids,
+                    'bmp': real_bmp,
+                    'score': score
+                })
+                
+        best_tuple = current_beam[0]
+        
+        covered_indices = set()
+        temp_mask = best_tuple['bmp']
+        qid = 0
+        while temp_mask > 0:
+            if temp_mask & 1: covered_indices.add(qid)
+            temp_mask >>= 1
+            qid += 1
+            
+        return {
+            'full_row': best_tuple['ids'], # ids 是 {alias: pk}
+            'covered_indices': covered_indices
+        }
 
     def sample_for_one_template(self, partitions, root_table, join_order_tree, template_data):
-        """
-        Algorithm 3
-        参考 sampler.py 的 sample 函数结构
-        针对单个 Template，构建 k 个样本集。
-        """
-
         join_graph = template_data['join_graph']
         for node, info in join_graph.nodes(data=True):
             sels = []
@@ -906,38 +871,64 @@ class JoinSampler:
             join_graph.nodes()[node]["sels"] = sels
 
         template_data['join_graph'] = join_graph
-
         generated_samples = []
-
         global_covered_queries = set()
         total_queries = template_data['queries_count']
-
+        
         pid_map, global_map = self.prepare_pid_to_qid_map(template_data)
         template_data['pid_map'] = pid_map
         template_data['global_map'] = global_map
 
-        root_partition_cache = {}
+        # === Preload Data into Engine ===
+        engine_tables_info = []
+        # 加载所有涉及的表，因为 Engine 现在负责所有的 Join
+        for node, info in join_graph.nodes(data=True):
+            raw_sels = info["sels"]
+            clean_cols = set()
+            for s in raw_sels:
+                col = s.split('.')[-1]
+                clean_cols.add(col)
+
+            if "id" in clean_cols:
+                clean_cols.remove("id")
+                final_cols_list = ["id"] + sorted(list(clean_cols))
+            elif "Id" in clean_cols:
+                clean_cols.remove("Id")
+                final_cols_list = ["Id"] + sorted(list(clean_cols))
+            else:
+                final_cols_list = ["id"] + sorted(list(clean_cols))
+
+            engine_tables_info.append({
+                'alias': node,
+                'real_name': template_data['real_names'][node],
+                'join_keys': final_cols_list
+            })
+        
+        # Preload 自动处理 Translation 和 Indexing
+        preload_start_time = time.time()
+        print(f"    --> Preloading data into Engine...")
+        self.engine.preload_data(engine_tables_info, template_data, self.workload_name)
+        print(f"        Preloading completed in {time.time() - preload_start_time:.2f}s.")
 
         for k in range(self.k_bitmaps):
             bitmap_start_time = time.time()
             print(f"    --> Constructing Bitmap {k+1}/{self.k_bitmaps}...")
             current_bitmap = []
 
-            if len(global_covered_queries) == total_queries and total_queries > 0:
-                print("        All queries covered. Stop sampling.")
+            if len(global_covered_queries) == total_queries:
+                print("        All queries already covered. Ending early.")
                 break
-
+            
             for p_idx, partition_ids in enumerate(partitions):
                 partition_select_time_start = time.time()
                 best_tuple_info = self.greedy_join_selection(
-                    partition_ids=partition_ids,
-                    partition_idx=p_idx,
-                    root_cache=root_partition_cache,
-                    root_table=root_table,
-                    join_tree=join_order_tree,
-                    template_data=template_data,
-                    global_covered_mask=global_covered_queries, # 当前已覆盖的集合
-                    limit_x=self.limit_x
+                    partition_ids, 
+                    p_idx, 
+                    root_table, 
+                    join_order_tree, 
+                    template_data, 
+                    global_covered_queries, 
+                    self.limit_x
                 )
 
                 if best_tuple_info:
@@ -952,29 +943,21 @@ class JoinSampler:
                 self.conn.commit()
             
             generated_samples.append(current_bitmap)
-
             coverage_pct = (len(global_covered_queries) / total_queries * 100) if total_queries > 0 else 0
             print(f"        Bitmap {k+1} constructed. Size: {len(current_bitmap)}. Global Coverage: {coverage_pct:.2f}%. Total Time: {time.time() - bitmap_start_time:.2f}s")
+
+            if coverage_pct > 95.0:
+                print("        Coverage threshold reached (>95%). Ending bitmap construction early.")
+                break
         
         return generated_samples
 
-
     def sample(self):
-        """
-        [主入口]
-        执行完整的 Join 采样流程，并保存结果。
-        """
-
         print("Starting Join Sampling Process...")
-
         start_time = time.time()
-
         self.load_and_parse_workload() 
-
         print(f"Total Join Templates Loaded: {len(self.join_templates)}, Workload Parsing Time: {time.time() - start_time:.2f}s")
-
         self.create_annotation_tables()
-
         if not self.join_templates:
             print("No join templates found. Exiting.")
             return
@@ -990,8 +973,15 @@ class JoinSampler:
 
         for template_id, template_data in self.join_templates.items():
             if len(template_data['aliases']) < 2:
-                print(f"\n=== Skipping Template: {template_id} (only {len(template_data['aliases'])} table) ===")
+                # print(f"\n=== Skipping Template: {template_id} (only {len(template_data['aliases'])} table) ===")
                 continue
+
+            if "mi1" in template_data['aliases'] or "mi2" in template_data['aliases'] or "ci" in template_data['aliases']:
+                # print(f"\n=== Skipping Template: {template_id} (contains problematic table) ===")
+                continue
+
+            # if len(template_data['aliases']) < 3 or len(template_data['aliases']) >= 5:
+            #     continue
 
             print(f"\n=== Processing Template: {template_id} ===")
             print(f"    Tables: {template_data['aliases']}")
@@ -1003,15 +993,10 @@ class JoinSampler:
             try:
                 join_order_tree, root_table = self.build_join_tree_structure(join_graph, aliases)
                 print(f"    Join Root: {root_table}")
-
-                # print("    Computing root weights...")
-                # root_weights = self.compute_root_weights(root_table, join_order_tree, template_data)
-
                 partitions = self.partition_root_table(root_table=root_table, 
                                                         m_partitions=self.m_partitions, 
                                                         template_data=template_data)
                 print(f"    Root table partitioned into {len(partitions)} segments.")
-
                 time_sampling_start = time.time()
 
                 template_samples = self.sample_for_one_template(
@@ -1023,10 +1008,8 @@ class JoinSampler:
                 
                 current_batch_samples[template_id] = template_samples
                 processed_count += 1
-
                 print(f"    Sampling completed in {time.time() - time_sampling_start:.2f}s.")
 
-                # 批量保存
                 if processed_count % SAVE_BATCH_SIZE == 0:
                     batch_filename = f"samples_batch_{batch_index}.json"
                     batch_full_path = os.path.join(self.output_path, batch_filename)
@@ -1040,7 +1023,6 @@ class JoinSampler:
                 import traceback
                 traceback.print_exc()
         
-        # 保存剩余样本
         if current_batch_samples:
             batch_filename = f"samples_batch_{batch_index}.json"
             batch_full_path = os.path.join(self.output_path, batch_filename)
@@ -1048,37 +1030,23 @@ class JoinSampler:
             print(f"    >>> Saved final batch {batch_index} (Templates {processed_count - len(current_batch_samples) + 1} to {processed_count})...")
         print(f"\nAll tasks finished. Results saved to directory: {self.output_path}. Total Time: {time.time() - start_time:.2f}s")
 
-
     def save_samples(self, samples_dict, output_path):
-        """
-        保存采样结果+格式转换
-        List[List[Dict{'alias': id}]] -> List[List[List[Header, Row1, Row2...]]]
-        Header 按别名字典序排列 (e.g., ["mi.id", "t.id"])
-        """
-
         formatted_output = {}
-
         for template_id, k_bitmaps in samples_dict.items():
             formatted_bitmaps = []
-
             for bitmap in k_bitmaps:
                 if not bitmap:
                     formatted_bitmaps.append([])
                     continue
-
                 aliases = sorted(bitmap[0].keys())
                 header = [f"{alias}.id" for alias in aliases]
                 formatted_rows = [header]
-
                 for row_dict in bitmap:
                     row = [row_dict[alias] for alias in aliases]
                     formatted_rows.append(row)
-                
                 formatted_bitmaps.append(formatted_rows)
-            
             formatted_output[template_id] = formatted_bitmaps
 
-        # 序列化保存
         def default_serializer(obj):
             import decimal
             import datetime
@@ -1107,3 +1075,8 @@ if __name__ == "__main__":
         sampler.sample()
     finally:
         sampler.close()
+
+
+# 算法4 采完元组之后按照Rj分组，选每个组内的最大值当作分数
+# 把采样算法改成wander join，还是用sql试一下，不要load到内存里
+# 还是遍历T吧，尤其第一个表要遍历T

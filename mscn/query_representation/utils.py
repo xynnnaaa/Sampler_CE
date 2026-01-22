@@ -30,10 +30,34 @@ COUNT_SIZE_TEMPLATE = "SELECT COUNT(*) FROM {FROM_CLAUSE}"
 REGEX_TEMPLATES = ['10a', '11a', '11b', '3b', '9b', '9a']
 TIMEOUT_CARD = 150001000000
 
+TABLE_CARD = {
+    "cast_info": 37610440,
+    "movie_info": 13399115,
+    "name": 5245495,
+    "title": 4733511,
+    "movie_keyword": 4523930,
+    "char_name": 3140339,
+    "person_info": 2963664,
+    "movie_companies": 2609129,
+    "movie_info_idx": 1380035,
+    "aka_name": 901343,
+    "aka_title": 361472,
+    "company_name": 234997,
+    "complete_cast": 135086,
+    "keyword": 134170,
+    "movie_link": 29997,
+    "info_type": 113,
+    "link_type": 18,
+    "role_type": 12,
+    "kind_type": 7,
+    "comp_cast_type": 4,
+    "company_type": 4,
+}
+
 import torch
 import numpy as np
 
-def is_valid_join_embedding(qname, node, join_embeddings):
+def is_valid_join_embedding(qname, node, join_embeddings, join_graph):
     """
     统一判断逻辑：如果 join embedding 存在且全为 0，则返回 False（表示跳过）。
     否则返回 True（表示保留）。
@@ -53,15 +77,27 @@ def is_valid_join_embedding(qname, node, join_embeddings):
     if node_key not in query_embs:
         return False # 找不到对应 subplan 的 embedding，视为全零 -> 过滤
 
-    emb = query_embs[node_key]
+    # emb = query_embs[node_key]
 
-    # 核心检查：是否全零
-    if isinstance(emb, torch.Tensor):
-        if torch.all(emb == 0):
-            return False
-    elif isinstance(emb, np.ndarray):
-        if np.all(emb == 0):
-            return False
+    # # 核心检查：是否全零
+    # if isinstance(emb, torch.Tensor):
+    #     if torch.all(emb == 0):
+    #         return False
+    # elif isinstance(emb, np.ndarray):
+    #     if np.all(emb == 0):
+    #         return False
+
+    # 新逻辑：只要只包含小表的查询
+
+    all_small = True
+    for alias in node:
+        real_name = join_graph.nodes[alias]["real_name"]
+        card = TABLE_CARD.get(real_name, float('inf'))
+        if card >= 3000000:
+            all_small = False
+            break
+    if not all_small:
+        return False
             
     return True
 

@@ -10,5 +10,5 @@ mscn/queries/
 mscn/.lc_cache
 mscn/results
 mscn/runfile
-join_sampling/embedding/results
+join_sampling/embedding/join
 join_sampling/embedding/single

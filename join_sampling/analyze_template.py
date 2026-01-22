@@ -352,12 +352,12 @@ class WorkloadAnalyzer:
         for idx, (key, sub_graph) in enumerate(self.unique_templates.items()):
             aliases = list(key[0])
 
-            # 只要所有表基数都小于10000的模版
+            # 只要所有表基数都小于1000000的模版
             all_small = True
             for alias in aliases:
                 real_name = sub_graph.nodes[alias]['real_name']
                 card = TABLE_CARD.get(real_name, float("inf"))
-                if card >= 1000000:
+                if card >= 3000000:
                     all_small = False
                     cnt += 1
                     break
@@ -500,7 +500,7 @@ class WorkloadAnalyzer:
 
 if __name__ == "__main__":
     # BASE_DIR = "/data1/xuyining/CEB/my_queries_all/half_ceb_full"
-    BASE_DIR = "/data1/xuyining/CEB-default/queries/ceb-imdb"
+    BASE_DIR = "/data2/xuyining/Sampler/mscn/queries/ceb-imdb"
     # BASE_DIR = "/data1/xuyining/Sampler/mscn/queries/joblight_train/joblight-train-all"
     
     analyzer = WorkloadAnalyzer(BASE_DIR, skip_7a=True)
