@@ -31,6 +31,28 @@ class WanderJoinEngine:
         elif right[0] == my_alias and left[0] == parent_alias:
             return right[1], left[1]
         return None, None
+    
+    def _translate_pid_bitmap(self, pid_bitmap_str, pid_map, global_mask_int):
+        """
+        将数据库读出的 PID Bitmap (str) 翻译为 QID Bitmap (int).
+        Args:
+            pid_bitmap_str: 例如 '10100...' (Postgres BIT VARYING)
+            pid_map: { pid(int): qid_mask(int) }
+            global_mask_int: 该表的全局 QID Mask (int)
+        Returns:
+            qid_mask (int)
+        """
+        result_mask = global_mask_int
+        
+        if not pid_bitmap_str:
+            return result_mask
+
+        pos = pid_bitmap_str.find('1')
+        while pos != -1:
+            result_mask |= pid_map.get(pos, 0)
+            pos = pid_bitmap_str.find('1', pos + 1)
+        
+        return result_mask
 
     def _batch_fetch_neighbors(self, table_real_name, my_join_col, parent_vals, sels, alias, workload_name=""):
         """
@@ -45,6 +67,7 @@ class WanderJoinEngine:
         for sel in sels:
             col_pure = sel.split('.')[-1]
             db_cols.append(f"t.{col_pure}")
+            # result_key的格式是"alias.col"
             result_keys.append(sel)
 
         cols_sql = ", ".join(db_cols) if db_cols else "t.id"
@@ -96,7 +119,7 @@ class WanderJoinEngine:
         [核心] 对 Beam 中的元组进行随机扩展采样。
         
         Args:
-            current_beam: List[Dict], T 中的元组列表
+            current_beam: List[Dict], T 中的元组列表, 每个元素包含 {'data': dict, 'bmp': int}
             lookahead_plan: List[Dict], 执行计划，第一项是 Rj
             k_samples: 每个元组采样多少条路径
             
@@ -106,27 +129,29 @@ class WanderJoinEngine:
               - 't_idx': 原始 T 元组的下标
               - 'rj_id': 选中的 Rj ID
               - 'rj_bmp': Rj 的真实 Bitmap
-              - 'score_bmp': Lookahead 聚合后的潜力 Bitmap
+              - 'score': Lookahead 聚合后的潜力
         """
         self.connect()
         
-        # 1. 准备并行路径
-        # 追踪所有 beam tuple 的 k 次采样
+        # 记录所有 beam tuple 的 k 次采样
         active_paths = []
         
-        for t_idx, t_data in enumerate(current_beam):
+        for t_idx, t_item in enumerate(current_beam):
+            t_data = t_item['data']
+            t_bmp = t_item['bmp']
+
             # t_data 是 { 'alias_col': val }
             for _ in range(k_samples):
                 active_paths.append({
                     't_idx': t_idx,
                     'vals': t_data.copy(), # Context: { "mi.id": "1", "mi.kind": "2" }
-                    'acc_bmp': 0,          # Path Accumulate
+                    'acc_bmp': t_bmp,          # Path Accumulate
                     'rj_data': None,       # 记录这一路选了哪个 Rj
                     'rj_bmp': 0,           # 记录 Rj 本身的 Bitmap
                     'alive': True
                 })
 
-        # 2. 执行 Plan (Step 0 是 Rj, Step 1... 是 Lookahead)
+        # 执行 Plan (Step 0 是 Rj, Step 1... 是 Lookahead)
         for step_idx, step in enumerate(lookahead_plan):
             alias = step['alias']
             real_name = step['real_name']
@@ -166,30 +191,21 @@ class WanderJoinEngine:
                 chosen = random.choice(candidates)
                 
                 # 计算 Bitmap
-                c_id = chosen['id'] 
-
                 raw_bmp = chosen['_bmp_str']
-                qid_mask = 0
-                if raw_bmp:
-                    pos = raw_bmp.find('1')
-                    while pos != -1:
-                        qid_mask |= my_pid_map.get(pos, 0)
-                        pos = raw_bmp.find('1', pos + 1)
-                qid_mask |= my_global_mask
+                qid_mask = self._translate_pid_bitmap(raw_bmp, my_pid_map, my_global_mask)
                 
-                # 更新路径状态
+                # 更新路径状态，一条路径上每个单表tuple的bitmap取交集
                 path['acc_bmp'] &= qid_mask
-                path['vals'].update(chosen)
+                path['vals'].update({k: v for k, v in chosen.items() if k != '_bmp_str'})
 
                 if step_idx == 0:
-                    path['rj_data'] = chosen
+                    path['rj_data'] = {k: v for k, v in chosen.items() if k != '_bmp_str'}
                     path['rj_bmp'] = qid_mask
 
         # 聚合结果
         proposed_candidates = []
-        max_results = defaultdict(int) # key是（t_idx, rj_id），值是能覆盖最多未覆盖查询的数量
-        real_bmps = {} # rj_id -> rj_bmp (这个是固定的)
-        real_data_map = {}
+        # 结构: { (t_idx, rj_id): {'score': max_score, 'rj_data': data, 'rj_bmp': bmp} }
+        best_results = {}
 
         rj_alias = lookahead_plan[0]['alias']
         rj_pk_key = f"{rj_alias}.id"
@@ -200,22 +216,21 @@ class WanderJoinEngine:
                 rj_pk = path['rj_data'][rj_pk_key]
                 key = (path['t_idx'], rj_pk)
 
-                if rj_pk not in real_bmps:
-                    real_bmps[rj_pk] = path['rj_bmp']
-                if key not in real_data_map:
-                    real_data_map[key] = path['rj_data']
-
                 score = bin(path['acc_bmp'] & uncovered_mask_int).count('1')
-                if score > max_results[key]:
-                    max_results[key] = score
+                if key not in best_results or score > best_results[key]['score']:
+                    best_results[key] = {
+                        'score': score,
+                        'rj_data': path['rj_data'],
+                        'rj_bmp': path['rj_bmp']
+                    }
 
         # 格式化输出
-        for (t_idx, rj_id), score in max_results.items():
+        for (t_idx, rj_id), res in best_results.items():
             proposed_candidates.append({
                 't_idx': t_idx,
-                'rj_data': real_data_map[(t_idx, rj_pk)], # 所需要的Rj的所有数据
-                'rj_bmp': real_bmps[rj_id],
-                'score': score
+                'rj_data': res['rj_data'], # 所需要的Rj的所有数据
+                'rj_bmp': res['rj_bmp'],
+                'score': res['score']
             })
             
         return proposed_candidates

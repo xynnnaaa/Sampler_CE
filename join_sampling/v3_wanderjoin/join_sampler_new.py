@@ -17,7 +17,7 @@ import sqlglot
 from sqlglot import exp
 
 # [Added] Import the Engine
-from Sampler.join_sampling.v3_wanderjoin.wander_join import JoinSamplingEngine
+from Sampler.join_sampling.v3_wanderjoin.wander_join import WanderJoinEngine
 
 def load_qrep(fn):
     assert ".pkl" in fn
@@ -337,34 +337,6 @@ class JoinSampler:
 
         return pid_map, global_map
     
-    def _translate_pid_bitmap(self, pid_bitmap_str, pid_map, global_mask_int):
-        """
-        将数据库读出的 PID Bitmap (str) 翻译为 QID Bitmap (int).
-        Args:
-            pid_bitmap_str: 例如 '10100...' (Postgres BIT VARYING)
-            pid_map: { pid(int): qid_mask(int) }
-            global_mask_int: 该表的全局 QID Mask (int)
-        Returns:
-            qid_mask (int)
-        """
-        result_mask = global_mask_int
-        
-        if not pid_bitmap_str:
-            return result_mask
-        
-        # for pid, char in enumerate(pid_bitmap_str):
-        #     if char == '1':
-        #         result_mask |= pid_map.get(pid, 0)
-
-        pos = pid_bitmap_str.find('1')
-        while pos != -1:
-            result_mask |= pid_map.get(pos, 0)
-            pos = pid_bitmap_str.find('1', pos + 1)
-        
-        return result_mask
-
-    def compute_root_weights(self):
-        pass
 
     def add_sel_info_to_graph(self, template_data):
         join_graph = template_data['join_graph']
@@ -616,142 +588,9 @@ class JoinSampler:
             
         print(f"    [Sidecar Setup] Finished. Total time: {time.time() - start_total:.2f}s", flush=True)
 
-    def _parse_join_condition_for_engine(self, raw_cond, child_alias, parent_alias):
-        """
-        辅助函数：解析 SQL 连接条件，提取 (my_col, target_alias, target_col)。
-        用于 Engine 的 get_candidates。
-        """
-        # raw_cond的结构例如 "t.id = mi.movie_id"
-        parts = raw_cond.split('=')
-        if len(parts) != 2: return []
-        
-        left = parts[0].strip().split('.')
-        right = parts[1].strip().split('.')
-        
-        child_col = None
-        target_col = None
-        target_alias_res = None
-        
-        if left[0] == child_alias:
-            child_col = left[1]
-            if right[0] == parent_alias:
-                target_col = right[1]
-                target_alias_res = right[0]
-        elif right[0] == child_alias:
-            child_col = right[1]
-            if left[0] == parent_alias:
-                target_col = left[1]
-                target_alias_res = left[0]
-                
-        if child_col and target_col:
-            return [(child_col, target_alias_res, target_col)]
-        return []
-
-    def _build_lookahead_forest(self, join_execution_plan, start_index, k_steps):
-        """
-        基于 join_execution_plan 构建 Lookahead Tree。
-        
-        Args:
-            join_execution_plan: 完整的执行计划列表
-            start_index: 当前 Rj 在 plan 中的下标
-            k_steps: 向后看多少步 (不包括 Rj 自己)
-        
-        Returns:
-            list: [tree_root_structure] (通常只有一个元素，因为 Rj 是唯一的根)
-        """
-        # 截取 Rj 及其后面的 K 个表
-        lookahead_slice = join_execution_plan[start_index : start_index + k_steps + 1]
-        
-        if not lookahead_slice:
-            return []
-            
-        # 初始化 Rj 是根
-        rj_node_data = lookahead_slice[0]
-        rj_alias = rj_node_data['alias']
-        
-        # 这里的 conds 是 Rj 连向 T 的条件，得到(rj_col, parent_alias, parent_col)
-        rj_conds = self._parse_join_condition_for_engine(
-            rj_node_data['join_condition'], 
-            rj_alias, 
-            rj_node_data['parent']
-        )
-
-        # key: alias, value: node_structure (dict)
-        tree_nodes = {}
-        
-        root_struct = {
-            'alias': rj_alias,
-            'conds': rj_conds,
-            'children': []
-        }
-        tree_nodes[rj_alias] = root_struct
-        
-        # 线性遍历后续表，尝试挂载
-        for step in lookahead_slice[1:]:
-            child_alias = step['alias']
-            parent_alias = step['parent']
-            raw_cond = step['join_condition']
-            
-            # 只有当 Parent 已经在树中时，才挂载
-            if parent_alias in tree_nodes:
-                conds = self._parse_join_condition_for_engine(raw_cond, child_alias, parent_alias)
-                
-                child_struct = {
-                    'alias': child_alias,
-                    'conds': conds,
-                    'children': []
-                }
-                
-                tree_nodes[parent_alias]['children'].append(child_struct)
-                
-                tree_nodes[child_alias] = child_struct
-            else:
-                # Parent 不在树中 (说明直接连 T 的更早节点)，跳过 
-                pass
-                
-        # 返回根节点
-        return [root_struct]
-
-
-# 辅助函数：将 Partition ID 转化为初始的 T (Beam)
-    def _initialize_root_beam(self, root_alias, partition_ids, pid_map, global_map, uncovered_mask_int, limit_x):
-        """
-        从 Partition IDs 构建初始的 Beam (T)。
-        完全在内存中进行，不查数据库。
-        """
-        candidates = []
-        
-        if root_alias not in self.engine.global_cache:
-            print(f"Error: Root table {root_alias} not loaded in Engine.")
-            return []
-            
-        root_cache = self.engine.global_cache[root_alias]['rows']
-        
-        for pid in partition_ids:
-            pk_str = str(pid)
-            if pk_str not in root_cache:
-                continue
-            
-            row_data = root_cache[pk_str]
-            current_bmp = self._translate_pid_bitmap(row_data['pid_bmp'], pid_map, global_map)
-
-            score = bin(current_bmp & uncovered_mask_int).count('1')
-            
-            candidate = {
-                'ids': {root_alias: pk_str},
-                'bmp': current_bmp,
-                'score': score # 仅用于排序
-            }
-            candidates.append(candidate)
-            
-        # 初始筛选 Top-K
-        candidates.sort(key=lambda x: x['score'], reverse=True)
-        return candidates[:limit_x]
-
     def greedy_join_selection(self, partition_ids, partition_idx, root_table, join_tree, template_data, global_covered_mask, limit_x):
         """
-        Algorithm 4: Pure Memory Version
-        完全移除 SQL Join，逻辑由 Engine 和 Python 接管。
+        Algorithm 4: Wander Join Implementation (Integrated Root Logic)
         """
         join_graph = template_data['join_graph']
         total_queries = template_data['queries_count']
@@ -764,17 +603,46 @@ class JoinSampler:
             uncovered_mask_int |= (1 << qid)
 
         # Root Beam (Step 0)
-        current_beam = self._initialize_root_beam(
-            root_table, 
+        if not partition_ids: return None
+        current_beam = []
+
+        root_step = join_tree[0]
+        root_sels = root_step['sels']
+        root_real = root_step['real_name']
+
+        neighbors = self.engine._batch_fetch_neighbors(
+            root_real, 
+            "id", 
             partition_ids, 
-            template_data['pid_map'].get(root_table, {}),
-            template_data['global_map'].get(root_table, 0),
-            uncovered_mask_int, 
-            limit_x
+            root_sels, 
+            root_table, 
+            self.workload_name
         )
-        
-        if not current_beam:
-            return None
+
+        root_pid_map = template_data['pid_map'].get(root_table, {})
+        root_global_map = template_data['global_map'].get(root_table, 0)
+
+        for pid in partition_ids:
+            p_val = str(pid)
+            rows = neighbors.get(p_val, [])
+            if not rows: continue
+
+            row_data = rows[0]
+            
+            # Bitmap 处理
+            raw_bmp = row_data['_bmp_str']
+            qid_mask = self.engine._translate_pid_bitmap(raw_bmp, root_pid_map, root_global_map)
+
+            clean_data = {k: v for k, v in row_data.items() if k != '_bmp_str'}
+            score = bin(qid_mask & uncovered_mask_int).count('1')
+            current_beam.append({
+                'data': clean_data,
+                'bmp': qid_mask,
+                'score': score
+            })
+
+        # root不剪枝
+        if not current_beam: return None
 
         # Step 1 to N
         # join_tree[0] 是 root, 循环从 1 开始
@@ -783,96 +651,74 @@ class JoinSampler:
             
             # 构建 Lookahead Tree
             current_plan_idx = step_idx + 1
-            
-            lookahead_tree_list = self._build_lookahead_forest(
-                join_tree, 
-                current_plan_idx, 
-                self.lookahead_k
+            wander_plan = join_tree[current_plan_idx : current_plan_idx + 1 + self.lookahead_k]
+            if not wander_plan: break
+
+            candidates = self.engine.sample_beam_extensions(
+                current_beam,
+                wander_plan,
+                template_data['pid_map'],
+                template_data['global_map'],
+                k_samples=self.lookahead_samples,
+                workload_name=self.workload_name,
+                uncovered_mask_int=uncovered_mask_int
             )
-            
-            lookahead_tree = lookahead_tree_list[0] if lookahead_tree_list else None
-            
-            if not lookahead_tree:
-                # 不应该发生
-                print(f"Warning: Lookahead tree empty at step {step_idx} for alias {next_alias}. Using single node.")
-                lookahead_tree = {
-                    'alias': next_alias, 
-                    'conds': self._parse_join_condition_for_engine(
-                        step['join_condition'], next_alias, step['parent']
-                    ),
-                    'children': []
-                }
 
-            # 扩展 Beam 中的每一个元组
-            next_candidates_heap = [] # Min-heap for Top-K
+            if not candidates: return None
 
-            self.engine.memo.clear() # 清空权重缓存
-            
-            for t_tuple in current_beam:
-                current_ids = t_tuple['ids'] # dict {alias: pk}
+            next_candidates_heap = []
+            for cand in candidates:
+                t_idx = cand['t_idx']
+                rj_data = cand['rj_data'] 
+                rj_bmp = cand['rj_bmp']   
+                best_score = cand['score'] # 带未来潜力的打分
+
+                t_tuple = current_beam[t_idx]
                 current_base_bmp = t_tuple['bmp']
 
-                extensions, rj_final_bmps = self.engine.sample_extensions(
-                    current_ids, 
-                    lookahead_tree, 
-                    k_samples=self.lookahead_samples,
-                    pid_map=template_data['pid_map'],
-                    global_map=template_data['global_map']
-                )
-                
-                if not extensions:
-                    continue
+                new_real_bmp = current_base_bmp & rj_bmp
 
-                # 处理扩展结果
-                for rj_id, lookahead_bmp in extensions.items():
-                    rj_real_bmp = rj_final_bmps.get(rj_id, 0)
+                new_data = t_tuple['data'].copy()
+                new_data.update(rj_data)
 
-                    new_real_bmp = current_base_bmp & rj_real_bmp
+                item = (best_score, new_data, new_real_bmp)
+                if len(next_candidates_heap) < limit_x:
+                    heapq.heappush(next_candidates_heap, item)
+                else:
+                    if best_score > next_candidates_heap[0][0]:
+                        heapq.heappushpop(next_candidates_heap, item)
 
-                    # CHECK: 打分逻辑还要再确认
-                    final_potential_bmp = current_base_bmp & lookahead_bmp
-                    
-                    score = bin(final_potential_bmp & uncovered_mask_int).count('1')
-                    
-                    # 构建新元组
-                    new_ids = current_ids.copy()
-                    new_ids[next_alias] = rj_id
-                    
-                    new_candidate = (score, next(self.tie_breaker), new_ids, new_real_bmp)
-
-                    # print(f"        Candidate Extension: ID={rj_id}, Score={score}")
-                    
-                    if len(next_candidates_heap) < limit_x:
-                        heapq.heappush(next_candidates_heap, new_candidate)
-                    else:
-                        if score > next_candidates_heap[0][0]:
-                            heapq.heapreplace(next_candidates_heap, new_candidate)
+            sorted_cands = sorted(next_candidates_heap, key=lambda x: x[0], reverse=True)
             
-            sorted_candidates = sorted(next_candidates_heap, key=lambda x: x[0], reverse=True)
-            
-            if not sorted_candidates:
-                return None # 死路
-            
+            if not sorted_cands: return None
+
             current_beam = []
-            for score, counter, ids, real_bmp in sorted_candidates:
+            for score, data, bmp in sorted_cands:
                 current_beam.append({
-                    'ids': ids,
-                    'bmp': real_bmp,
+                    'data': data, 
+                    'bmp': bmp, 
                     'score': score
                 })
-                
+
         best_tuple = current_beam[0]
-        
+        full_row_ids = {}
+        for k, v in best_tuple['data'].items():
+            # k 的格式是 "alias.col"
+            if k.endswith(".id") or k.endswith(".Id"):
+                alias = k.split('.')[0]
+                full_row_ids[alias] = v
+
         covered_indices = set()
         temp_mask = best_tuple['bmp']
         qid = 0
         while temp_mask > 0:
-            if temp_mask & 1: covered_indices.add(qid)
+            if temp_mask & 1:
+                covered_indices.add(qid)
             temp_mask >>= 1
             qid += 1
             
         return {
-            'full_row': best_tuple['ids'], # ids 是 {alias: pk}
+            'full_row': full_row_ids,
             'covered_indices': covered_indices
         }
 
@@ -951,9 +797,9 @@ class JoinSampler:
                 # print(f"\n=== Skipping Template: {template_id} (only {len(template_data['aliases'])} table) ===")
                 continue
 
-            if "mi1" in template_data['aliases'] or "mi2" in template_data['aliases'] or "ci" in template_data['aliases']:
+            # if "mi1" in template_data['aliases'] or "mi2" in template_data['aliases'] or "ci" in template_data['aliases']:
                 # print(f"\n=== Skipping Template: {template_id} (contains problematic table) ===")
-                continue
+                # continue
 
             # if len(template_data['aliases']) < 3 or len(template_data['aliases']) >= 5:
             #     continue
