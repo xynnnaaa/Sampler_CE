@@ -272,7 +272,7 @@ class QueryDataset(data.Dataset):
         self.join_emb_dim = 0
 
         # 新加的特殊处理
-        self.sub_use_join_embedding = True
+        self.sub_use_join_embedding = False
 
         if self.join_embedding_dir is not None:
             print(f"Join Sampling Enabled. Loading from: {self.join_embedding_dir}")
@@ -438,7 +438,7 @@ class QueryDataset(data.Dataset):
 
             # 新增过滤条件：检查 join embedding 是否有效
             if not is_valid_join_embedding(qrep["name"], node,
-                    self.join_embeddings, qrep["join_graph"]):
+                    self.join_embeddings):
                 continue
 
             x,y = self.featurizer.get_subplan_features(qrep,

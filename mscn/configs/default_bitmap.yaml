@@ -12,7 +12,7 @@ eval:
 data:
     query_dir: "./queries/ceb-imdb"
     eval_query_dir: ""
-    bitmap_dir: "./queries/single_table_bitmap/"
+    bitmap_dir: "./queries/default_bitmap/"
 
     # query_dir: "./queries/ceb-imdb"
     # eval_query_dir: ""
@@ -46,7 +46,7 @@ data:
 
     # join sampling新加的参数
     use_join_sampling: True
-    join_embedding_dir: "../join_sampling/embedding/results"
+    join_embedding_dir: "../join_sampling/embedding/join/join_tree"
 
 # only need these features for computing plan costs
 db:
@@ -72,9 +72,11 @@ featurizer:
   global_feat_tables : 0
   #bitmap_dir : "./queries/allbitmaps/"
 
+  use_single_table_sample_embedding : False
+
   sample_bitmap : 1
   sample_bitmap_num : 70
-  sample_bitmap_buckets : 1000
+  sample_bitmap_buckets : 70
   bitmap_onehotmask : 1
 
   feat_separate_alias : 0 # treat aliases as separate tables
@@ -119,10 +121,10 @@ model:
   normalize_flow_loss : 1
 
   # important training / optimization flags
-  max_epochs : 2000
+  max_epochs : 500
   eval_epoch : 4 # how often to evaluate on eval_fns during training
   eval_fns : "qerr" # logging things during training
-  lr : 0.0001
+  lr : 0.001
   num_hidden_layers : 2
   hidden_layer_size : 128
 

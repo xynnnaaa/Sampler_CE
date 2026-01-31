@@ -2,12 +2,16 @@ import psycopg2
 import random
 from collections import defaultdict
 import re
+import time
 
 class WanderJoinEngine:
     def __init__(self, db_config):
         self.db_config = db_config
         self.conn = None
         self.cursor = None
+        self.connect()
+
+        self.bitmap_cache = {}
 
     def connect(self):
         if not self.conn:
@@ -31,7 +35,7 @@ class WanderJoinEngine:
         elif right[0] == my_alias and left[0] == parent_alias:
             return right[1], left[1]
         return None, None
-    
+
     def _translate_pid_bitmap(self, pid_bitmap_str, pid_map, global_mask_int):
         """
         将数据库读出的 PID Bitmap (str) 翻译为 QID Bitmap (int).
@@ -43,7 +47,6 @@ class WanderJoinEngine:
             qid_mask (int)
         """
         result_mask = global_mask_int
-        
         if not pid_bitmap_str:
             return result_mask
 
@@ -51,12 +54,12 @@ class WanderJoinEngine:
         while pos != -1:
             result_mask |= pid_map.get(pos, 0)
             pos = pid_bitmap_str.find('1', pos + 1)
-        
+
         return result_mask
 
-    def _batch_fetch_neighbors(self, table_real_name, my_join_col, parent_vals, sels, alias, workload_name=""):
+    def _batch_fetch_neighbors(self, table_real_name, my_join_col, parent_vals, sels, alias):
         """
-        批量获取邻居。同时查询出sels中所有连接列
+        批量获取邻居。同时查询出sels中所有连接列, 不Join Sidecar, 不查Bitmap
         """
         if not parent_vals: return {}
         unique_vals = list(set(parent_vals))
@@ -74,12 +77,10 @@ class WanderJoinEngine:
         
         # 构造 SQL
         vals_str = ",".join([f"'{v}'" for v in unique_vals])
-        sidecar = f"{table_real_name}_anno_idx_{workload_name}" if workload_name else f"{table_real_name}_anno_idx"
         
         sql = f"""
-            SELECT {cols_sql}, s.query_anno::text
+            SELECT {cols_sql}
             FROM {table_real_name} t
-            JOIN {sidecar} s ON t.id = s.query_anno_id
             WHERE t.{my_join_col} IN ({vals_str})
         """
         
@@ -103,16 +104,57 @@ class WanderJoinEngine:
             return {}
 
         for r in rows:
-            bmp_str = r[-1]
             p_val = str(r[join_col_idx])
 
-            row_data = {'_bmp_str': bmp_str}
+            row_data = {}
             for i, key in enumerate(result_keys):
                 row_data[key] = str(r[i])
                 
             neighbors[p_val].append(row_data)
             
         return neighbors
+    
+    def _batch_fetch_translate_bitmaps(self, table_real_name, ids, workload_name="", alias="", pid_map={}, global_map=0):
+        """
+        [新增] 给定一批主键 ID，批量从 Sidecar 表获取 Bitmap 并翻译，存入缓存。
+        """
+        if not ids: return {}
+        unique_ids = list(set(ids))
+
+        result_map = {} # {id_str: qid_int}
+        missing_ids = []
+
+        for uid in unique_ids:
+            cache_key = (alias, uid)
+            if cache_key in self.bitmap_cache:
+                result_map[str(uid)] = self.bitmap_cache[cache_key]
+            else:
+                missing_ids.append(uid)
+
+        if missing_ids:
+            vals_str = ",".join([f"'{v}'" for v in missing_ids])
+            sidecar = f"{table_real_name}_anno_idx_{workload_name}" if workload_name else f"{table_real_name}_anno_idx"
+
+            # 直接查 Sidecar
+            sql = f"""
+                SELECT query_anno_id, query_anno::text
+                FROM {sidecar}
+                WHERE query_anno_id IN ({vals_str})
+            """
+        
+            self.cursor.execute(sql)
+            rows = self.cursor.fetchall()
+
+            for r in rows:
+                rid = str(r[0])
+                raw_bmp_str = r[1]
+                
+                # 立即翻译
+                qid_mask = self._translate_pid_bitmap(raw_bmp_str, pid_map, global_map)
+                self.bitmap_cache[(alias, rid)] = qid_mask
+                result_map[rid] = qid_mask
+
+        return result_map
 
     def sample_beam_extensions(self, current_beam, lookahead_plan, pid_map_full, global_map_full, k_samples=1, workload_name="", uncovered_mask_int=0):
         """
@@ -136,6 +178,13 @@ class WanderJoinEngine:
         # 记录所有 beam tuple 的 k 次采样
         active_paths = []
         
+        # 计时统计
+        total_batch_fetch_time = 0.0
+        batch_fetch_calls = 0
+
+        total_translate_time = 0.0
+        translate_calls = 0
+
         for t_idx, t_item in enumerate(current_beam):
             t_data = t_item['data']
             t_bmp = t_item['bmp']
@@ -158,7 +207,7 @@ class WanderJoinEngine:
             parent_alias = step['parent']
             raw_cond = step['join_condition']
             sel_cols = step.get('sels', [])
-            
+
             my_col, parent_col = self._parse_cond(raw_cond, alias, parent_alias)
             if not my_col: continue
 
@@ -172,12 +221,20 @@ class WanderJoinEngine:
 
             if not batch_vals: break
 
-            neighbors = self._batch_fetch_neighbors(real_name, my_col, batch_vals, sel_cols, alias, workload_name)
+            # 计时：_batch_fetch_neighbors
+            t_bf0 = time.time()
+            neighbors = self._batch_fetch_neighbors(real_name, my_col, batch_vals, sel_cols, alias)
+            t_bf1 = time.time()
+            batch_fetch_calls += 1
+            total_batch_fetch_time += (t_bf1 - t_bf0)
 
             my_pid_map = pid_map_full.get(alias, {})
             my_global_mask = global_map_full.get(alias, 0)
+
+            pending_bitmap_ids = []
+            path_selections = {} 
             
-            for path in active_paths:
+            for i, path in enumerate(active_paths):
                 if not path['alive']: continue
                 
                 p_val = str(path['vals'].get(parent_key))
@@ -189,17 +246,41 @@ class WanderJoinEngine:
 
                 # wander join: 随机选一个扩展
                 chosen = random.choice(candidates)
-                
-                # 计算 Bitmap
-                raw_bmp = chosen['_bmp_str']
-                qid_mask = self._translate_pid_bitmap(raw_bmp, my_pid_map, my_global_mask)
-                
-                # 更新路径状态，一条路径上每个单表tuple的bitmap取交集
-                path['acc_bmp'] &= qid_mask
-                path['vals'].update({k: v for k, v in chosen.items() if k != '_bmp_str'})
+                path_selections[i] = chosen
 
+                chosen_id = chosen.get(f"{alias}.id") or chosen.get(f"{alias}.Id")
+                if chosen_id:
+                    pending_bitmap_ids.append(chosen_id)
+                else:
+                    path['alive'] = False
+
+            if not pending_bitmap_ids:
+                continue
+
+            # 批量获取并翻译 Bitmap
+
+            t_tr0 = time.time()
+            translated_map = self._batch_fetch_translate_bitmaps(
+                real_name, 
+                pending_bitmap_ids, 
+                workload_name=workload_name, 
+                alias=alias, 
+                pid_map=my_pid_map, 
+                global_map=my_global_mask
+            )
+            t_tr1 = time.time()
+            translate_calls += 1
+            total_translate_time += (t_tr1 - t_tr0)
+
+            # 更新 path 状态
+            for i, chosen in path_selections.items():
+                path = active_paths[i]
+                chosen_id = chosen.get(f"{alias}.id") or chosen.get(f"{alias}.Id")
+                qid_mask = translated_map.get(chosen_id, my_global_mask)
+                path['acc_bmp'] &= qid_mask
+                path['vals'].update(chosen)
                 if step_idx == 0:
-                    path['rj_data'] = {k: v for k, v in chosen.items() if k != '_bmp_str'}
+                    path['rj_data'] = chosen
                     path['rj_bmp'] = qid_mask
 
         # 聚合结果
@@ -232,5 +313,8 @@ class WanderJoinEngine:
                 'rj_bmp': res['rj_bmp'],
                 'score': res['score']
             })
-            
+
+        print(f"                _batch_fetch_neighbors called {batch_fetch_calls} times, total time: {total_batch_fetch_time:.4f}s")
+        print(f"                _translate_pid_bitmap called {translate_calls} times, total time: {total_translate_time:.4f}s")
+
         return proposed_candidates

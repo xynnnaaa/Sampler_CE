@@ -17,7 +17,7 @@ import sqlglot
 from sqlglot import exp
 
 # [Added] Import the Engine
-from Sampler.join_sampling.v3_wanderjoin.wander_join import WanderJoinEngine
+from wander_join import WanderJoinEngine
 
 def load_qrep(fn):
     assert ".pkl" in fn
@@ -127,7 +127,7 @@ class JoinSampler:
             raise e
         
         # [Added] Initialize Engine
-        self.engine = JoinSamplingEngine(self.db_config)
+        self.engine = WanderJoinEngine(self.db_config)
 
         import itertools
         self.tie_breaker = itertools.count()
@@ -385,8 +385,8 @@ class JoinSampler:
                 root_table = alias
                 break
 
-        if root_table is None or root_table == 'ci' or root_table == 'mi1' or root_table == 'mi2':
-            root_table = scored[0][1]
+        # if root_table is None or root_table == 'ci' or root_table == 'mi1' or root_table == 'mi2':
+        #     root_table = scored[0][1]
 
         visited = {root_table}
 
@@ -610,17 +610,26 @@ class JoinSampler:
         root_sels = root_step['sels']
         root_real = root_step['real_name']
 
+        t_root_start = time.time()
         neighbors = self.engine._batch_fetch_neighbors(
             root_real, 
             "id", 
             partition_ids, 
             root_sels, 
-            root_table, 
-            self.workload_name
+            root_table
         )
 
         root_pid_map = template_data['pid_map'].get(root_table, {})
         root_global_map = template_data['global_map'].get(root_table, 0)
+
+        translated_map = self.engine._batch_fetch_translate_bitmaps(
+            root_real,
+            partition_ids,
+            workload_name=self.workload_name,
+            alias=root_table,
+            pid_map=root_pid_map,
+            global_map=root_global_map
+        )
 
         for pid in partition_ids:
             p_val = str(pid)
@@ -630,18 +639,24 @@ class JoinSampler:
             row_data = rows[0]
             
             # Bitmap 处理
-            raw_bmp = row_data['_bmp_str']
-            qid_mask = self.engine._translate_pid_bitmap(raw_bmp, root_pid_map, root_global_map)
+            qid_mask = translated_map.get(p_val, root_global_map)
 
-            clean_data = {k: v for k, v in row_data.items() if k != '_bmp_str'}
             score = bin(qid_mask & uncovered_mask_int).count('1')
             current_beam.append({
-                'data': clean_data,
+                'data': row_data,
                 'bmp': qid_mask,
                 'score': score
             })
 
-        # root不剪枝
+        # root剪枝
+        current_beam.sort(key=lambda x: x['score'], reverse=True)
+        current_beam = current_beam[:limit_x]
+
+        t_root_end = time.time()
+        try:
+            print(f"            Root processing time: {t_root_end - t_root_start:.3f}s; root candidates: {len(current_beam)}")
+        except Exception:
+            pass
         if not current_beam: return None
 
         # Step 1 to N
@@ -654,6 +669,7 @@ class JoinSampler:
             wander_plan = join_tree[current_plan_idx : current_plan_idx + 1 + self.lookahead_k]
             if not wander_plan: break
 
+            t_sample_start = time.time()
             candidates = self.engine.sample_beam_extensions(
                 current_beam,
                 wander_plan,
@@ -663,6 +679,12 @@ class JoinSampler:
                 workload_name=self.workload_name,
                 uncovered_mask_int=uncovered_mask_int
             )
+            t_sample_end = time.time()
+            try:
+                cand_count = len(candidates) if candidates else 0
+                print(f"            Step {step_idx+1} ({next_alias}) sample_beam_extensions time: {t_sample_end - t_sample_start:.3f}s; candidates: {cand_count}")
+            except Exception:
+                pass
 
             if not candidates: return None
 
@@ -681,7 +703,7 @@ class JoinSampler:
                 new_data = t_tuple['data'].copy()
                 new_data.update(rj_data)
 
-                item = (best_score, new_data, new_real_bmp)
+                item = (best_score, next(self.tie_breaker), new_data, new_real_bmp)
                 if len(next_candidates_heap) < limit_x:
                     heapq.heappush(next_candidates_heap, item)
                 else:
@@ -693,7 +715,7 @@ class JoinSampler:
             if not sorted_cands: return None
 
             current_beam = []
-            for score, data, bmp in sorted_cands:
+            for score, counter, data, bmp in sorted_cands:
                 current_beam.append({
                     'data': data, 
                     'bmp': bmp, 
@@ -730,6 +752,8 @@ class JoinSampler:
         pid_map, global_map = self.prepare_pid_to_qid_map(template_data)
         template_data['pid_map'] = pid_map
         template_data['global_map'] = global_map
+
+        self.engine.bitmap_cache.clear()
 
         for k in range(self.k_bitmaps):
             bitmap_start_time = time.time()
@@ -798,11 +822,14 @@ class JoinSampler:
                 continue
 
             # if "mi1" in template_data['aliases'] or "mi2" in template_data['aliases'] or "ci" in template_data['aliases']:
-                # print(f"\n=== Skipping Template: {template_id} (contains problematic table) ===")
-                # continue
-
-            # if len(template_data['aliases']) < 3 or len(template_data['aliases']) >= 5:
+            #     # print(f"\n=== Skipping Template: {template_id} (contains problematic table) ===")
             #     continue
+
+            # if "it1" not in template_data['aliases'] and "it2" not in template_data['aliases']:
+            #     continue
+
+            if len(template_data['aliases']) < 3:
+                continue
 
             print(f"\n=== Processing Template: {template_id} ===")
             print(f"    Tables: {template_data['aliases']}")

@@ -1219,8 +1219,8 @@ class Featurizer():
                     self.table_features_len = len(self.tables) + self.embedding_dim
                     self.max_table_feature_len = len(self.tables) + self.embedding_dim
                 else:
-                    self.table_features_len = len(self.tables) + self.sample_bitmap_num
-                    self.max_table_feature_len = len(self.tables) + self.sample_bitmap_num
+                    self.table_features_len = len(self.tables) + self.sample_bitmap_buckets
+                    self.max_table_feature_len = len(self.tables) + self.sample_bitmap_buckets
             else:
                 self.table_features_len = len(self.tables) + len(self.tables)*self.sample_bitmap_buckets
                 self.max_table_feature_len = len(self.tables) + \

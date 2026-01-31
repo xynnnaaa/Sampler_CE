@@ -11,4 +11,4 @@ mscn/.lc_cache
 mscn/results
 mscn/runfile
 join_sampling/embedding/join
-join_sampling/embedding/single
+join_sampling/embedding/single_table_allhit
