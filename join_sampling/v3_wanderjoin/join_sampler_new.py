@@ -385,8 +385,10 @@ class JoinSampler:
                 root_table = alias
                 break
 
-        # if root_table is None or root_table == 'ci' or root_table == 'mi1' or root_table == 'mi2':
-        #     root_table = scored[0][1]
+        # 2.6 这里新加了特殊处理
+        if len(aliases) <= 4:
+            if root_table is None or root_table == 'ci' or root_table == 'mi1' or root_table == 'mi2':
+                root_table = scored[0][1]
 
         visited = {root_table}
 
@@ -594,6 +596,8 @@ class JoinSampler:
         """
         join_graph = template_data['join_graph']
         total_queries = template_data['queries_count']
+
+        execute_time_total = 0.0
         
         # 计算 Uncovered Mask
         all_query_ids = set(range(total_queries))
@@ -611,7 +615,7 @@ class JoinSampler:
         root_real = root_step['real_name']
 
         t_root_start = time.time()
-        neighbors = self.engine._batch_fetch_neighbors(
+        neighbors, execute_time = self.engine._batch_fetch_neighbors(
             root_real, 
             "id", 
             partition_ids, 
@@ -619,10 +623,12 @@ class JoinSampler:
             root_table
         )
 
+        execute_time_total += execute_time
+
         root_pid_map = template_data['pid_map'].get(root_table, {})
         root_global_map = template_data['global_map'].get(root_table, 0)
 
-        translated_map = self.engine._batch_fetch_translate_bitmaps(
+        translated_map, execute_time = self.engine._batch_fetch_translate_bitmaps(
             root_real,
             partition_ids,
             workload_name=self.workload_name,
@@ -630,6 +636,7 @@ class JoinSampler:
             pid_map=root_pid_map,
             global_map=root_global_map
         )
+        execute_time_total += execute_time
 
         for pid in partition_ids:
             p_val = str(pid)
@@ -670,7 +677,7 @@ class JoinSampler:
             if not wander_plan: break
 
             t_sample_start = time.time()
-            candidates = self.engine.sample_beam_extensions(
+            candidates, execute_time = self.engine.sample_beam_extensions(
                 current_beam,
                 wander_plan,
                 template_data['pid_map'],
@@ -680,6 +687,7 @@ class JoinSampler:
                 uncovered_mask_int=uncovered_mask_int
             )
             t_sample_end = time.time()
+            execute_time_total += execute_time
             try:
                 cand_count = len(candidates) if candidates else 0
                 print(f"            Step {step_idx+1} ({next_alias}) sample_beam_extensions time: {t_sample_end - t_sample_start:.3f}s; candidates: {cand_count}")
@@ -742,7 +750,7 @@ class JoinSampler:
         return {
             'full_row': full_row_ids,
             'covered_indices': covered_indices
-        }
+        }, execute_time_total
 
     def sample_for_one_template(self, partitions, root_table, join_order_tree, template_data):
         generated_samples = []
@@ -766,7 +774,7 @@ class JoinSampler:
             
             for p_idx, partition_ids in enumerate(partitions):
                 partition_select_time_start = time.time()
-                best_tuple_info = self.greedy_join_selection(
+                best_tuple_info, execute_time = self.greedy_join_selection(
                     partition_ids, 
                     p_idx, 
                     root_table, 
@@ -781,9 +789,11 @@ class JoinSampler:
                     newly_covered = best_tuple_info['covered_indices']
                     incremental_gain = len(newly_covered - global_covered_queries)
                     global_covered_queries.update(newly_covered)
-                    print(f"          Partition {p_idx+1}/{len(partitions)}: Selected tuple covers {incremental_gain} new queries. Time: {time.time() - partition_select_time_start:.2f}s")
+                    time_percentage = (execute_time / (time.time() - partition_select_time_start) * 100) if (time.time() - partition_select_time_start) > 0 else 0
+                    print(f"          Partition {p_idx+1}/{len(partitions)}: Selected tuple covers {incremental_gain} new queries. Time: {time.time() - partition_select_time_start:.2f}s, Execute Query Time: {execute_time:.2f}s (time percentage: {time_percentage:.2f}%)")
                 else:
-                    print(f"          Partition {p_idx+1}/{len(partitions)}: No valid tuple found. Time: {time.time() - partition_select_time_start:.2f}s")
+                    time_percentage = (execute_time / (time.time() - partition_select_time_start) * 100) if (time.time() - partition_select_time_start) > 0 else 0
+                    print(f"          Partition {p_idx+1}/{len(partitions)}: No valid tuple found. Time: {time.time() - partition_select_time_start:.2f}s, Execute Query Time: {execute_time:.2f}s (time percentage: {time_percentage:.2f}%)")
 
                 self.conn.commit()
             
@@ -828,8 +838,11 @@ class JoinSampler:
             # if "it1" not in template_data['aliases'] and "it2" not in template_data['aliases']:
             #     continue
 
-            if len(template_data['aliases']) < 3:
-                continue
+            # if len(template_data['aliases']) < 3:
+            #     continue
+
+            # if template_id != "ct_kt_mc_mi1_t_18bd46":
+            #     continue
 
             print(f"\n=== Processing Template: {template_id} ===")
             print(f"    Tables: {template_data['aliases']}")
@@ -925,8 +938,3 @@ if __name__ == "__main__":
         sampler.sample()
     finally:
         sampler.close()
-
-
-# 算法4 采完元组之后按照Rj分组，选每个组内的最大值当作分数
-# 把采样算法改成wander join，还是用sql试一下，不要load到内存里
-# 还是遍历T吧，尤其第一个表要遍历T

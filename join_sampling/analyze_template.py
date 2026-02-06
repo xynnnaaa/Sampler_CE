@@ -207,7 +207,38 @@ class JoinPathTrie:
 
         return results
 
+    def analyze_wanderjoin_efficiency(self):
+        k = 1
+        efficient_count = 0
+        total_count = 0
 
+        stack = [self.root]  # 从根节点开始遍历所有节点
+        
+        while stack:
+            node = stack.pop()
+            total_count += 1
+            
+            # 检查从当前节点开始的连续k层是否都是单分支
+            current = node
+            is_efficient = True
+            
+            for i in range(k):
+                if not current.children or len(current.children) != 1:
+                    is_efficient = False
+                    break
+                current = next(iter(current.children.values()))  # 获取唯一的子节点
+            
+            if is_efficient:
+                efficient_count += 1
+            
+            # 继续遍历所有子节点
+            for child in node.children.values():
+                stack.append(child)
+
+        print(f"Strategy Efficiency Analysis:")
+        print(f"Total nodes: {total_count}")
+        print(f"Nodes with single-child paths of length {k}: {efficient_count}")
+        print(f"Efficiency Ratio: {100 * efficient_count / total_count:.2f}%")
 
 class WorkloadAnalyzer:
     def __init__(self, base_query_dir, skip_7a=False):
@@ -352,17 +383,17 @@ class WorkloadAnalyzer:
         for idx, (key, sub_graph) in enumerate(self.unique_templates.items()):
             aliases = list(key[0])
 
-            # 只要所有表基数都小于1000000的模版
-            all_small = True
-            for alias in aliases:
-                real_name = sub_graph.nodes[alias]['real_name']
-                card = TABLE_CARD.get(real_name, float("inf"))
-                if card >= 3000000:
-                    all_small = False
-                    cnt += 1
-                    break
-            if not all_small:
-                continue
+            # # 只要所有表基数都小于1000000的模版
+            # all_small = True
+            # for alias in aliases:
+            #     real_name = sub_graph.nodes[alias]['real_name']
+            #     card = TABLE_CARD.get(real_name, float("inf"))
+            #     if card >= 3000000:
+            #         all_small = False
+            #         cnt += 1
+            #         break
+            # if not all_small:
+            #     continue
 
             try:
                 path_signature = get_deterministic_execution_plan(sub_graph, aliases)
@@ -397,6 +428,8 @@ class WorkloadAnalyzer:
                 f"templates={stats['templates']}, "
                 f"leaves={stats['leaves']}, "
                 f"queries={stats['queries']}")
+            
+        self.trie.analyze_wanderjoin_efficiency()
             
 
     def load_one_template(self, template_name):
