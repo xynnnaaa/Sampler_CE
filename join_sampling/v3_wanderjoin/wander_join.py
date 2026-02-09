@@ -19,15 +19,15 @@ class WanderJoinEngine:
         if not self.conn:
             self.conn = psycopg2.connect(**self.db_config)
             self.cursor = self.conn.cursor()
-            self.cursor.execute("""
-                CREATE TEMP TABLE IF NOT EXISTS temp_partition_filter (
-                    pid bigint
-                ) ON COMMIT PRESERVE ROWS;
-            """)
-            self.cursor.execute("""
-                CREATE INDEX IF NOT EXISTS temp_partition_filter_pid_idx
-                ON temp_partition_filter(pid);
-            """)
+            # self.cursor.execute("""
+            #     CREATE TEMP TABLE IF NOT EXISTS temp_partition_filter (
+            #         pid bigint
+            #     ) ON COMMIT PRESERVE ROWS;
+            # """)
+            # self.cursor.execute("""
+            #     CREATE INDEX IF NOT EXISTS temp_partition_filter_pid_idx
+            #     ON temp_partition_filter(pid);
+            # """)
 
     def close(self):
         if self.cursor: self.cursor.close()
@@ -90,26 +90,26 @@ class WanderJoinEngine:
         cols_sql = ", ".join(db_cols) if db_cols else "t.id"
         
         # 构造 SQL
-        # vals_str = ",".join([f"'{v}'" for v in unique_vals])
+        vals_str = ",".join([f"'{v}'" for v in unique_vals])
         
-        # sql = f"""
-        #     SELECT {cols_sql}
-        #     FROM {table_real_name} t
-        #     WHERE t.{my_join_col} IN ({vals_str})
-        # """
-
-        # 使用temp_partition_filter表来避免SQL长度过长问题
-        self.cursor.execute("TRUNCATE temp_partition_filter")
-        buf = io.StringIO()
-        for val in unique_vals:
-            buf.write(f"{val}\n")
-        buf.seek(0)
-        self.cursor.copy_from(buf, 'temp_partition_filter', columns=("pid",))
         sql = f"""
             SELECT {cols_sql}
             FROM {table_real_name} t
-            JOIN temp_partition_filter pf ON t.{my_join_col} = pf.pid
+            WHERE t.{my_join_col} IN ({vals_str})
         """
+
+        # 使用temp_partition_filter表来避免SQL长度过长问题
+        # self.cursor.execute("TRUNCATE temp_partition_filter")
+        # buf = io.StringIO()
+        # for val in unique_vals:
+        #     buf.write(f"{val}\n")
+        # buf.seek(0)
+        # self.cursor.copy_from(buf, 'temp_partition_filter', columns=("pid",))
+        # sql = f"""
+        #     SELECT {cols_sql}
+        #     FROM {table_real_name} t
+        #     JOIN temp_partition_filter pf ON t.{my_join_col} = pf.pid
+        # """
 
         execute_start = time.time()
         self.cursor.execute(sql)
@@ -163,30 +163,31 @@ class WanderJoinEngine:
                 missing_ids.append(uid_str)
 
         if missing_ids:
-            # vals_str = ",".join([f"'{v}'" for v in missing_ids])
-            # sidecar = f"{table_real_name}_anno_idx_{workload_name}" if workload_name else f"{table_real_name}_anno_idx"
-
-            # # 直接查 Sidecar
-            # sql = f"""
-            #     SELECT query_anno_id, query_anno::text
-            #     FROM {sidecar}
-            #     WHERE query_anno_id IN ({vals_str})
-            # """
-
-
-            # 同样用 temp_partition_filter 来避免 SQL 长度问题
-            self.cursor.execute("TRUNCATE temp_partition_filter")
-            buf = io.StringIO()
-            for mid in missing_ids:
-                buf.write(f"{mid}\n")
-            buf.seek(0)
-            self.cursor.copy_from(buf, 'temp_partition_filter', columns=("pid",))
+            vals_str = ",".join([f"'{v}'" for v in missing_ids])
             sidecar = f"{table_real_name}_anno_idx_{workload_name}" if workload_name else f"{table_real_name}_anno_idx"
+
+            # 直接查 Sidecar
             sql = f"""
                 SELECT query_anno_id, query_anno::text
                 FROM {sidecar}
-                JOIN temp_partition_filter pf ON {sidecar}.query_anno_id = pf.pid
+                WHERE query_anno_id IN ({vals_str})
             """
+
+
+            # 同样用 temp_partition_filter 来避免 SQL 长度问题
+            # self.cursor.execute("TRUNCATE temp_partition_filter")
+            # buf = io.StringIO()
+            # for mid in missing_ids:
+            #     buf.write(f"{mid}\n")
+            # buf.seek(0)
+            # self.cursor.copy_from(buf, 'temp_partition_filter', columns=("pid",))
+            # sidecar = f"{table_real_name}_anno_idx_{workload_name}" if workload_name else f"{table_real_name}_anno_idx"
+            # sql = f"""
+            #     SELECT query_anno_id, query_anno::text
+            #     FROM {sidecar}
+            #     JOIN temp_partition_filter pf ON {sidecar}.query_anno_id = pf.pid
+            # """
+
             execute_start = time.time()
             self.cursor.execute(sql)
             execute_query_time += time.time() - execute_start

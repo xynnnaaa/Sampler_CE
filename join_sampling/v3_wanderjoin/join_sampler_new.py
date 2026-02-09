@@ -111,15 +111,15 @@ class JoinSampler:
         try:
             self.conn = psycopg2.connect(**self.db_config)
             self.cursor = self.conn.cursor()
-            self.cursor.execute("""
-                CREATE TEMP TABLE IF NOT EXISTS temp_partition_filter (
-                    pid bigint
-                ) ON COMMIT PRESERVE ROWS;
-            """)
-            self.cursor.execute("""
-                CREATE INDEX IF NOT EXISTS temp_partition_filter_pid_idx
-                ON temp_partition_filter(pid);
-            """)
+            # self.cursor.execute("""
+            #     CREATE TEMP TABLE IF NOT EXISTS temp_partition_filter (
+            #         pid bigint
+            #     ) ON COMMIT PRESERVE ROWS;
+            # """)
+            # self.cursor.execute("""
+            #     CREATE INDEX IF NOT EXISTS temp_partition_filter_pid_idx
+            #     ON temp_partition_filter(pid);
+            # """)
 
             print("Database connection established.")
         except Exception as e:
@@ -810,7 +810,33 @@ class JoinSampler:
         
         return generated_samples
 
-    def sample(self, worker_id=9, num_workers=10):
+    def load_existing_template_ids(self, cur_output_path):
+        """
+        在采样前读取结果目录中所有 samples_batch_*.json 文件，
+        返回已经生成过样本的 template_id 集合。
+        """
+        existing = set()
+        try:
+            if not os.path.exists(cur_output_path):
+                return existing
+
+            batch_files = sorted(glob.glob(os.path.join(cur_output_path, "samples_batch_*.json")))
+            for bf in batch_files:
+                try:
+                    with open(bf, 'r') as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        for tid in data.keys():
+                            existing.add(tid)
+                except Exception as e:
+                    print(f"Warning: failed to read existing batch file {bf}: {e}")
+        except Exception as e:
+            print(f"Warning while scanning existing samples in {cur_output_path}: {e}")
+
+        print(f"Found {len(existing)} already-generated templates in '{cur_output_path}'.")
+        return existing
+
+    def sample(self, worker_id=0, num_workers=10):
         print(f"Starting Join Sampling Process (Worker {worker_id}/{num_workers})...")
         start_time = time.time()
         self.load_and_parse_workload() 
@@ -826,6 +852,9 @@ class JoinSampler:
             os.makedirs(cur_output_path)
             print(f"Created output directory: {cur_output_path}")
 
+        # 在开始采样前，加载已有的 samples_batch_*.json，记录已生成的 template_id，用于跳过
+        existing_templates = self.load_existing_template_ids(cur_output_path)
+
         SAVE_BATCH_SIZE = 10
         current_batch_samples = {}
         processed_count = 0
@@ -833,9 +862,21 @@ class JoinSampler:
 
         all_items = list(self.join_templates.items())
         my_tasks = []
+        skipped = 0
+        # 构建分配给当前 worker 的任务列表，跳过已经存在的 template，并将已存在的计入 processed_count
         for i, item in enumerate(all_items):
             if i % num_workers == worker_id:
+                template_id = item[0]
+                if template_id in existing_templates:
+                    skipped += 1
+                    processed_count += 1
+                    continue
                 my_tasks.append(item)
+
+        # 初始化 batch_index 使之与已存在的 processed_count 对齐，避免覆盖已有批次文件
+        batch_index = processed_count // SAVE_BATCH_SIZE
+        if skipped:
+            print(f"Worker {worker_id}: Skipped {skipped} templates already generated. Initialized processed_count={processed_count}, batch_index={batch_index}.")
         print(f"Worker {worker_id}: Assigned {len(my_tasks)}/{len(all_items)} templates.")
 
         for template_id, template_data in my_tasks:
