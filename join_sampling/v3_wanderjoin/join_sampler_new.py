@@ -607,7 +607,7 @@ class JoinSampler:
             uncovered_mask_int |= (1 << qid)
 
         # Root Beam (Step 0)
-        if not partition_ids: return None
+        if not partition_ids: return None, 0.0
         current_beam = []
 
         root_step = join_tree[0]
@@ -664,7 +664,7 @@ class JoinSampler:
             print(f"            Root processing time: {t_root_end - t_root_start:.3f}s; root candidates: {len(current_beam)}")
         except Exception:
             pass
-        if not current_beam: return None
+        if not current_beam: return None, 0.0
 
         # Step 1 to N
         # join_tree[0] 是 root, 循环从 1 开始
@@ -694,7 +694,7 @@ class JoinSampler:
             except Exception:
                 pass
 
-            if not candidates: return None
+            if not candidates: return None, 0.0
 
             next_candidates_heap = []
             for cand in candidates:
@@ -720,7 +720,7 @@ class JoinSampler:
 
             sorted_cands = sorted(next_candidates_heap, key=lambda x: x[0], reverse=True)
             
-            if not sorted_cands: return None
+            if not sorted_cands: return None, 0.0
 
             current_beam = []
             for score, counter, data, bmp in sorted_cands:
@@ -804,29 +804,41 @@ class JoinSampler:
             if coverage_pct > 95.0:
                 print("        Coverage threshold reached (>95%). Ending bitmap construction early.")
                 break
+            if coverage_pct < 1.0:
+                print("        Coverage too low (<1%). Continuing to next bitmap. May recheck strategy for this template.")
+                break
         
         return generated_samples
 
-    def sample(self):
-        print("Starting Join Sampling Process...")
+    def sample(self, worker_id=9, num_workers=10):
+        print(f"Starting Join Sampling Process (Worker {worker_id}/{num_workers})...")
         start_time = time.time()
         self.load_and_parse_workload() 
         print(f"Total Join Templates Loaded: {len(self.join_templates)}, Workload Parsing Time: {time.time() - start_time:.2f}s")
-        self.create_annotation_tables()
+        # self.create_annotation_tables()
         if not self.join_templates:
             print("No join templates found. Exiting.")
             return
         
-        if not os.path.exists(self.output_path):
-            os.makedirs(self.output_path)
-            print(f"Created output directory: {self.output_path}")
+        cur_output_path = os.path.join(self.output_path, str(worker_id))
+
+        if not os.path.exists(cur_output_path):
+            os.makedirs(cur_output_path)
+            print(f"Created output directory: {cur_output_path}")
 
         SAVE_BATCH_SIZE = 10
         current_batch_samples = {}
         processed_count = 0
         batch_index = 0
 
-        for template_id, template_data in self.join_templates.items():
+        all_items = list(self.join_templates.items())
+        my_tasks = []
+        for i, item in enumerate(all_items):
+            if i % num_workers == worker_id:
+                my_tasks.append(item)
+        print(f"Worker {worker_id}: Assigned {len(my_tasks)}/{len(all_items)} templates.")
+
+        for template_id, template_data in my_tasks:
             if len(template_data['aliases']) < 2:
                 # print(f"\n=== Skipping Template: {template_id} (only {len(template_data['aliases'])} table) ===")
                 continue
@@ -875,7 +887,7 @@ class JoinSampler:
 
                 if processed_count % SAVE_BATCH_SIZE == 0:
                     batch_filename = f"samples_batch_{batch_index}.json"
-                    batch_full_path = os.path.join(self.output_path, batch_filename)
+                    batch_full_path = os.path.join(cur_output_path, batch_filename)
                     self.save_samples(current_batch_samples, batch_full_path)
                     print(f"    >>> Saved batch {batch_index} (Templates {processed_count - SAVE_BATCH_SIZE + 1} to {processed_count}), Used Time: {time.time() - start_time:.2f}s")
                     batch_index += 1
@@ -888,7 +900,7 @@ class JoinSampler:
         
         if current_batch_samples:
             batch_filename = f"samples_batch_{batch_index}.json"
-            batch_full_path = os.path.join(self.output_path, batch_filename)
+            batch_full_path = os.path.join(cur_output_path, batch_filename)
             self.save_samples(current_batch_samples, batch_full_path)
             print(f"    >>> Saved final batch {batch_index} (Templates {processed_count - len(current_batch_samples) + 1} to {processed_count})...")
         print(f"\nAll tasks finished. Results saved to directory: {self.output_path}. Total Time: {time.time() - start_time:.2f}s")

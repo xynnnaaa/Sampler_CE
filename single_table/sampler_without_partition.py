@@ -9,6 +9,7 @@ from collections import defaultdict
 import random
 import glob
 import pickle
+import time
 
 class Sampler:
     def __init__(self, config_path: str):
@@ -257,59 +258,8 @@ class Sampler:
         relevant_queries: List[Dict[str, Any]],
         covered_queries: set
     ) -> Any:
-        if not partition_ids:
-            return None
-            
-        uncovered_queries_with_indices = [(i, q) for i, q in enumerate(relevant_queries) if i not in covered_queries]
-        
-        if not uncovered_queries_with_indices:
-            return random.choice(partition_ids)
-
-        from collections import Counter
-        tuple_scores = Counter()
-        BATCH_SIZE = 100
-        
-        # primary_key_col = self.primary_key[table]
-        primary_key_col = 'id'
-        partition_ids_str = ', '.join(map(str, partition_ids))
-
-        for i in range(0, len(uncovered_queries_with_indices), BATCH_SIZE):
-            batch = uncovered_queries_with_indices[i:i + BATCH_SIZE]
-            
-            sum_clauses = []
-            for index, query in batch:
-                # safe_predicate = query['predicate_sql'].replace("'", "''")
-                sum_clauses.append(f"CASE WHEN ({query['predicate_sql']}) THEN 1 ELSE 0 END")
-
-            if not sum_clauses:
-                continue
-
-            score_calculation = " + ".join(sum_clauses)
-            
-            batch_query = f"""
-                SELECT {primary_key_col}, ({score_calculation}) as score
-                FROM {table}
-                WHERE {primary_key_col} IN ({partition_ids_str})
-            """
-
-            # print(batch_query)
-            
-            try:
-                self.cursor.execute(batch_query)
-                for key_id, score in self.cursor.fetchall():
-                    if score > 0:
-                        tuple_scores[key_id] += score
-            except Exception as e:
-                print(f"Error executing batch scoring query on table {table}: {e}")
-                self.conn.rollback()
-                continue
-
-        if tuple_scores:
-            best_tuple = tuple_scores.most_common(1)[0][0]
-            print(f"    selected tuple covers {tuple_scores[best_tuple]} new queries.")
-            return best_tuple
-        else:
-            return random.choice(partition_ids)
+        # This method is no longer used. Keep signature for compatibility.
+        return None
 
 
     def update_covered_queries(
@@ -366,23 +316,95 @@ class Sampler:
         if newly_covered_indices:
             covered_queries.update(newly_covered_indices)
 
+    def select_best_tuple(self, table: str, relevant_queries: List[Dict[str, Any]], covered_queries: set) -> Any:
+        """Selects the best tuple from the entire table (no partitioning).
+        Evaluates uncovered queries in batches and picks the row with highest score.
+        If no uncovered queries, returns a random row's primary key.
+        """
+        uncovered_queries_with_indices = [(i, q) for i, q in enumerate(relevant_queries) if i not in covered_queries]
+
+        # primary_key_col = self.primary_key[table]
+        primary_key_col = 'id'
+
+        # If there are no uncovered queries, return a random tuple from the table
+        if not uncovered_queries_with_indices:
+            try:
+                self.cursor.execute(f"SELECT {primary_key_col} FROM {table} ORDER BY random() LIMIT 1")
+                row = self.cursor.fetchone()
+                return row[0] if row else None
+            except Exception as e:
+                print(f"Error selecting random tuple from table {table}: {e}")
+                self.conn.rollback()
+                return None
+
+        from collections import Counter
+        tuple_scores = Counter()
+        BATCH_SIZE = 100
+
+        for i in range(0, len(uncovered_queries_with_indices), BATCH_SIZE):
+            batch = uncovered_queries_with_indices[i:i + BATCH_SIZE]
+
+            sum_clauses = []
+            for index, query in batch:
+                sum_clauses.append(f"CASE WHEN ({query['predicate_sql']}) THEN 1 ELSE 0 END")
+
+            if not sum_clauses:
+                continue
+
+            score_calculation = " + ".join(sum_clauses)
+
+            batch_query = f"""
+                SELECT {primary_key_col}, ({score_calculation}) as score
+                FROM {table}
+            """
+
+            try:
+                self.cursor.execute(batch_query)
+                for key_id, score in self.cursor.fetchall():
+                    if score and score > 0:
+                        tuple_scores[key_id] += score
+            except Exception as e:
+                print(f"Error executing scoring query on table {table}: {e}")
+                self.conn.rollback()
+                continue
+
+        if tuple_scores:
+            best_tuple = tuple_scores.most_common(1)[0][0]
+            print(f"    selected tuple covers {tuple_scores[best_tuple]} new queries.")
+            return best_tuple
+        else:
+            try:
+                self.cursor.execute(f"SELECT {primary_key_col} FROM {table} ORDER BY random() LIMIT 1")
+                row = self.cursor.fetchone()
+                return row[0] if row else None
+            except Exception as e:
+                print(f"Error selecting fallback random tuple from table {table}: {e}")
+                self.conn.rollback()
+                return None
+
     def sample(self):
         """Main sampling function that orchestrates the sampling process."""
         parsed_workload = self.parse_workload()
+        time_start = time.time()
         for table, queries in parsed_workload.items():
+            if table == "movie_info":
+                print(f"Skipping table {table} as per configuration.")
+                continue
+            time_cur_table_start = time.time()
             print(f"Sampling for table {table} with {len(queries)} relevant queries...")
             self.samples[table] = []
             is_small, partitions = self.partition_table(table)
             if is_small:
                 print(f"Table {table} is small. Skipping sampling.")
                 continue
-            
-            print(f"Table {table} partitioned into {len(partitions)} partitions.")
+
+            print(f"Table {table} will use {self.m_partitions} sampling slots (no physical partitions).")
             covered_queries = set()
 
             num_total_queries = len(queries)
 
             for j in range(self.k_bitmaps):
+                time_cur_bitmap_start = time.time()
                 print(f"Constructing bitmap {j+1}/{self.k_bitmaps} for table {table}...")
 
                 if len(covered_queries) == num_total_queries:
@@ -390,15 +412,13 @@ class Sampler:
                     break
 
                 current_bitmap = []
-                for i, partition in enumerate(partitions):
+                for i in range(self.m_partitions):
                     num_covered_before = len(covered_queries)
 
-                    print(f"  Processing partition {i+1}/{len(partitions)} with {len(partition)} tuples...")
+                    print(f"  Processing slot {i+1}/{self.m_partitions}...")
                     print(f"    Covered queries before selection: {num_covered_before}/{num_total_queries} ({num_covered_before/num_total_queries if num_total_queries > 0 else 0:.1%})")
 
-                    selected_tuple = self.select_best_tuple_from_partition(
-                        table, partition, queries, covered_queries
-                    )
+                    selected_tuple = self.select_best_tuple(table, queries, covered_queries)
                     if selected_tuple:
                         current_bitmap.append(selected_tuple)
                         print(f"    Selected tuple: {selected_tuple}")
@@ -410,7 +430,14 @@ class Sampler:
                         print(f"    Warning: No tuple selected for this partition.")
 
                 self.samples[table].append(current_bitmap)
-                print(f"--- Bitmap {j+1} for '{table}' constructed. Final size: {len(current_bitmap)} ---")
+                time_cur_bitmap_end = time.time()
+                print(f"--- Bitmap {j+1} for '{table}' constructed. Final size: {len(current_bitmap)}. Time: {time_cur_bitmap_end - time_cur_bitmap_start:.2f}s ---")
+
+            time_cur_table_end = time.time()
+            print(f"=== Sampling for table '{table}' complete. Time: {time_cur_table_end - time_cur_table_start:.2f}s ===\n")
+
+        time_end = time.time()
+        print(f"Sampling complete. Total time: {time_end - time_start:.2f}s")
     
     def save_samples(self, output_path: str):
         """Saves the sampled data to a JSON file."""
@@ -429,7 +456,7 @@ if __name__ == "__main__":
     sampler = Sampler("/data2/xuyining/Sampler/single_table/ceb_imdb_results/sampler_config.json")
     try:
         sampler.sample()
-        sampler.save_samples("/data2/xuyining/Sampler/single_table/ceb_imdb_results/with_partition/samples.json")
+        sampler.save_samples("/data2/xuyining/Sampler/single_table/ceb_imdb_results/without_partition/samples.json")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
