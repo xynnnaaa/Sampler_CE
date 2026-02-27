@@ -232,7 +232,8 @@ class Sampler:
         primary_key_col = 'id'
         if not primary_key_col:
             raise ValueError(f"No primary key found for table {table}")
-        self.cursor.execute(f"SELECT {primary_key_col} FROM {table} ORDER BY {primary_key_col}")
+        # self.cursor.execute(f"SELECT {primary_key_col} FROM {table} ORDER BY {primary_key_col}")
+        self.cursor.execute(f"SELECT {primary_key_col} FROM {table} ORDER BY RANDOM()")
         row_ids = [row[0] for row in self.cursor.fetchall()]
         n = len(row_ids)
 
@@ -426,10 +427,10 @@ class Sampler:
         print("Database connection closed.")
 
 if __name__ == "__main__":
-    sampler = Sampler("/data2/xuyining/Sampler/single_table/ceb_imdb_results/sampler_config.json")
+    sampler = Sampler("/data2/xuyining/Sampler/single_table/ceb_imdb_results/1000/sampler_config.json")
     try:
         sampler.sample()
-        sampler.save_samples("/data2/xuyining/Sampler/single_table/ceb_imdb_results/with_partition/samples.json")
+        sampler.save_samples("/data2/xuyining/Sampler/single_table/ceb_imdb_results/1000/samples.json")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:

@@ -375,8 +375,10 @@ class WanderJoinEngine:
         # 遍历所有wander join结果
         # 聚合结果（计时）
         t_ag0 = time.time()
+        wander_success_count = 0
         for path in active_paths:
             if path['alive'] and path['rj_data'] is not None:
+                wander_success_count += 1
                 rj_pk = path['rj_data'][rj_pk_key]
                 key = (path['t_idx'], rj_pk)
 
@@ -402,11 +404,12 @@ class WanderJoinEngine:
 
         print(f"                _batch_fetch_neighbors called {batch_fetch_calls} times, total time: {total_batch_fetch_time:.4f}s")
         print(f"                _translate_pid_bitmap called {translate_calls} times, total time: {total_translate_time:.4f}s")
-        # # 新增详细计时输出
-        # print(f"                init active_paths time: {total_init_active_paths_time:.6f}s")
-        # print(f"                build batch_vals total time: {total_build_batch_vals_time:.6f}s, total batch_vals collected: {total_batch_vals}")
-        # print(f"                selection total time: {total_selection_time:.6f}s, candidates chosen: {total_candidates_chosen}")
-        # print(f"                update paths total time: {total_update_paths_time:.6f}s, updates applied: {total_update_count}")
-        # print(f"                aggregation time: {total_aggregation_time:.6f}s")
+        # 新增详细计时输出
+        print(f"                init active_paths time: {total_init_active_paths_time:.6f}s")
+        print(f"                build batch_vals total time: {total_build_batch_vals_time:.6f}s, total batch_vals collected: {total_batch_vals}")
+        print(f"                selection total time: {total_selection_time:.6f}s, candidates chosen: {total_candidates_chosen}")
+        print(f"                update paths total time: {total_update_paths_time:.6f}s, updates applied: {total_update_count}")
+        print(f"                aggregation time: {total_aggregation_time:.6f}s")
+        print(f"                wander join success count: {wander_success_count}, success rate: {wander_success_count/len(active_paths) if active_paths else 0:.4f}")
 
         return proposed_candidates, execute_query_time

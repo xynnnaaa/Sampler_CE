@@ -4,6 +4,8 @@
 imdb_base_only.dump
 *.sh
 *.sql
+*.pt
+*.pkl
 .DS_Store
 **/.DS_Store
 mscn/queries/
