@@ -973,6 +973,7 @@ class JoinSampler:
             self.conn.rollback()
             return False, t_fetch_compute
         
+
     def execute_join_step(self, node, input_table, output_table, pid_map, global_map, covered_mask, total_queries):
         try:
             # Uncovered Mask = (Relevant - Covered)
@@ -1009,6 +1010,8 @@ class JoinSampler:
 
             t_join_start = time.time()
 
+            # 执行T和下一张表的join，并且把sidecar表join进来，拿到pid_bitmap
+            # TODO：这里可以先不join sidecar表
             fetch_join_sql = f"""
                 SELECT
                     {prev_select_str},
@@ -1039,6 +1042,7 @@ class JoinSampler:
                 n_pid_str = row[-2]
                 row_data = row[:-2] # 合并后的 ID 列表
                 
+                # TODO: 这里可以加缓存
                 n_qid_mask = self._translate_pid_bitmap(n_pid_str, r_map, r_global)
                 new_anno_mask = n_qid_mask & int(t_qid_str, 2)
                 

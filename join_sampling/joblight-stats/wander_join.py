@@ -7,7 +7,6 @@ import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import numpy as np
-import line_profiler
 
 class WanderJoinEngine:
     def __init__(self, db_config):
@@ -205,7 +204,6 @@ class WanderJoinEngine:
 
         return result_map, execute_query_time
 
-    @line_profiler.profile
     def sample_beam_extensions(self, current_beam, lookahead_plan, pid_map_full, global_map_full, k_samples=1, workload_name="", uncovered_mask_int=0):
         """
         [核心] 对 Beam 中的元组进行随机扩展采样。
@@ -324,7 +322,8 @@ class WanderJoinEngine:
                 path_selections[i] = chosen
                 chosen_count += 1
 
-                chosen_id = chosen.get(f"{alias}.id") or chosen.get(f"{alias}.Id")
+                # chosen_id = chosen.get(f"{alias}.id") or chosen.get(f"{alias}.Id")
+                chosen_id = chosen.get(f"{alias}.id")
                 if chosen_id:
                     pending_bitmap_ids.add(chosen_id)
                 else:
@@ -358,7 +357,8 @@ class WanderJoinEngine:
             update_count = 0
             for i, chosen in path_selections.items():
                 path = active_paths[i]
-                chosen_id = chosen.get(f"{alias}.id") or chosen.get(f"{alias}.Id")
+                # chosen_id = chosen.get(f"{alias}.id") or chosen.get(f"{alias}.Id")
+                chosen_id = chosen.get(f"{alias}.id")
                 qid_mask = translated_map.get(chosen_id, my_global_mask)
                 path['acc_bmp'] &= qid_mask
                 path['vals'].update(chosen)

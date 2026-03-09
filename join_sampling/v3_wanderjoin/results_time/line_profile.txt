@@ -1,0 +1,224 @@
+Timer unit: 1e-06 s
+
+Total time: 423.245 s
+File: /data2/xuyining/Sampler/join_sampling/v3_wanderjoin/wander_join.py
+Function: sample_beam_extensions at line 208
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   208                                               @line_profiler.profile
+   209                                               def sample_beam_extensions(self, current_beam, lookahead_plan, pid_map_full, global_map_full, k_samples=1, workload_name="", uncovered_mask_int=0):
+   210                                                   """
+   211                                                   [核心] 对 Beam 中的元组进行随机扩展采样。
+   212                                                   
+   213                                                   Args:
+   214                                                       current_beam: List[Dict], T 中的元组列表, 每个元素包含 {'data': dict, 'bmp': int}
+   215                                                       lookahead_plan: List[Dict], 执行计划，第一项是 Rj
+   216                                                       k_samples: 每个元组采样多少条路径
+   217                                                       
+   218                                                   Returns:
+   219                                                       List[Dict]: 扩展后的候选元组列表。
+   220                                                       每个元素包含:
+   221                                                         - 't_idx': 原始 T 元组的下标
+   222                                                         - 'rj_id': 选中的 Rj ID
+   223                                                         - 'rj_bmp': Rj 的真实 Bitmap
+   224                                                         - 'score': Lookahead 聚合后的潜力
+   225                                                   """
+   226        18         97.2      5.4      0.0          self.connect()
+   227                                           
+   228        18          8.8      0.5      0.0          execute_query_time = 0.0
+   229                                                   
+   230                                                   # 记录所有 beam tuple 的 k 次采样
+   231        18         11.9      0.7      0.0          active_paths = []
+   232                                           
+   233                                                   # 计时统计 - 初始化累计变量
+   234        18         10.6      0.6      0.0          total_batch_fetch_time = 0.0
+   235        18         10.3      0.6      0.0          batch_fetch_calls = 0
+   236                                           
+   237        18          9.3      0.5      0.0          total_translate_time = 0.0
+   238        18         11.0      0.6      0.0          translate_calls = 0
+   239                                           
+   240        18          9.0      0.5      0.0          total_init_active_paths_time = 0.0
+   241        18          6.5      0.4      0.0          total_build_batch_vals_time = 0.0
+   242        18          9.3      0.5      0.0          total_batch_vals = 0
+   243        18          8.4      0.5      0.0          total_selection_time = 0.0
+   244        18          9.7      0.5      0.0          total_candidates_chosen = 0
+   245        18          6.3      0.4      0.0          total_update_paths_time = 0.0
+   246        18          9.3      0.5      0.0          total_update_count = 0
+   247        18         10.9      0.6      0.0          total_aggregation_time = 0.0
+   248                                           
+   249                                                   # 初始化 active_paths（计时）
+   250        18         20.5      1.1      0.0          t_init0 = time.time()
+   251      9015       3582.8      0.4      0.0          for t_idx, t_item in enumerate(current_beam):
+   252      8997       4374.2      0.5      0.0              t_data = t_item['data']
+   253      8997       2863.9      0.3      0.0              t_bmp = t_item['bmp']
+   254                                           
+   255                                                       # t_data 是 { 'alias_col': val }
+   256   4507497     854213.6      0.2      0.2              for _ in range(k_samples):
+   257   8997000    2943490.5      0.3      0.7                  active_paths.append({
+   258   4498500     669605.6      0.1      0.2                      't_idx': t_idx,
+   259   4498500    7145224.9      1.6      1.7                      'vals': t_data.copy(), # Context: { "mi.id": "1", "mi.kind": "2" }
+   260   4498500     662931.0      0.1      0.2                      'acc_bmp': t_bmp,          # Path Accumulate
+   261   4498500     791048.0      0.2      0.2                      'rj_data': None,       # 记录这一路选了哪个 Rj
+   262   4498500     816312.3      0.2      0.2                      'rj_bmp': 0,           # 记录 Rj 本身的 Bitmap
+   263   4498500     807515.4      0.2      0.2                      'alive': True
+   264                                                           })
+   265        18         66.9      3.7      0.0          t_init1 = time.time()
+   266        18         37.1      2.1      0.0          total_init_active_paths_time += (t_init1 - t_init0)
+   267                                           
+   268                                                   # 执行 Plan (Step 0 是 Rj, Step 1... 是 Lookahead)
+   269        63        174.5      2.8      0.0          for step_idx, step in enumerate(lookahead_plan):
+   270        45         45.9      1.0      0.0              alias = step['alias']
+   271        45         34.4      0.8      0.0              real_name = step['real_name']
+   272        45         38.2      0.8      0.0              parent_alias = step['parent']
+   273        45         45.7      1.0      0.0              raw_cond = step['join_condition']
+   274        45        106.2      2.4      0.0              sel_cols = step.get('sels', [])
+   275                                           
+   276        45       1324.2     29.4      0.0              my_col, parent_col = self._parse_cond(raw_cond, alias, parent_alias)
+   277        45         27.5      0.6      0.0              if not my_col: continue
+   278                                           
+   279        45         52.8      1.2      0.0              parent_key = f"{parent_alias}.{parent_col}"
+   280        45      16902.2    375.6      0.0              batch_vals = []
+   281                                                       # 收集 batch_vals（计时）
+   282        45         64.6      1.4      0.0              t_bvals0 = time.time()
+   283  11245545    2401708.3      0.2      0.6              for path in active_paths:
+   284  11245500    3224360.6      0.3      0.8                  if path['alive']:
+   285  11244000    3827292.5      0.3      0.9                      val = path['vals'].get(parent_key)
+   286  11244000    2436420.5      0.2      0.6                      if val:
+   287  11244000    3867235.9      0.3      0.9                          batch_vals.append(val)
+   288                                                               else:
+   289                                                                   path['alive'] = False
+   290        45        160.0      3.6      0.0              t_bvals1 = time.time()
+   291        45         82.0      1.8      0.0              total_build_batch_vals_time += (t_bvals1 - t_bvals0)
+   292        45         91.0      2.0      0.0              total_batch_vals += len(batch_vals)
+   293                                           
+   294        45         31.6      0.7      0.0              if not batch_vals: break
+   295                                           
+   296                                                       # 计时：_batch_fetch_neighbors
+   297        45         25.9      0.6      0.0              t_bf0 = time.time()
+   298        45   94715999.1  2.1e+06     22.4              neighbors, execute_time = self._batch_fetch_neighbors(real_name, my_col, batch_vals, sel_cols, alias)
+   299        45         83.8      1.9      0.0              t_bf1 = time.time()
+   300        45         46.2      1.0      0.0              batch_fetch_calls += 1
+   301        45         55.7      1.2      0.0              total_batch_fetch_time += (t_bf1 - t_bf0)
+   302        45         29.2      0.6      0.0              execute_query_time += execute_time
+   303                                           
+   304        45         98.4      2.2      0.0              my_pid_map = pid_map_full.get(alias, {})
+   305        45         51.2      1.1      0.0              my_global_mask = global_map_full.get(alias, 0)
+   306                                           
+   307        45        831.4     18.5      0.0              pending_bitmap_ids = set()
+   308        45      72457.2   1610.2      0.0              path_selections = {}
+   309                                                       # 为每个 path 选择候选并收集 pending ids（计时）
+   310        45         77.7      1.7      0.0              t_sel0 = time.time()
+   311        45         27.1      0.6      0.0              chosen_count = 0
+   312  11245545    3757224.0      0.3      0.9              for i, path in enumerate(active_paths):
+   313  11245500    4454746.6      0.4      1.1                  if not path['alive']: continue
+   314                                           
+   315  11244000    6345873.5      0.6      1.5                  p_val = str(path['vals'].get(parent_key))
+   316  11244000    4785063.8      0.4      1.1                  candidates = neighbors.get(p_val, [])
+   317                                           
+   318  11244000    3525259.1      0.3      0.8                  if not candidates:
+   319     52000      22833.6      0.4      0.0                      path['alive'] = False
+   320     52000      18131.6      0.3      0.0                      continue
+   321                                           
+   322                                                           # wander join: 随机选一个扩展
+   323  11192000   20305486.8      1.8      4.8                  chosen = random.choice(candidates)
+   324  11192000    4099177.3      0.4      1.0                  path_selections[i] = chosen
+   325  11192000    4238083.6      0.4      1.0                  chosen_count += 1
+   326                                           
+   327  11192000    5745997.8      0.5      1.4                  chosen_id = chosen.get(f"{alias}.id") or chosen.get(f"{alias}.Id")
+   328  11192000    3555185.4      0.3      0.8                  if chosen_id:
+   329  11192000    5441100.9      0.5      1.3                      pending_bitmap_ids.add(chosen_id)
+   330                                                           else:
+   331                                                               path['alive'] = False
+   332        45        134.0      3.0      0.0              t_sel1 = time.time()
+   333        45         64.4      1.4      0.0              total_selection_time += (t_sel1 - t_sel0)
+   334        45         24.8      0.6      0.0              total_candidates_chosen += chosen_count
+   335                                           
+   336        45         36.1      0.8      0.0              if not pending_bitmap_ids:
+   337                                                           continue
+   338                                           
+   339                                                       # 批量获取并翻译 Bitmap，这里会比不使用wander join的方法要快，因为只需要查询和翻译被选中的Rj，而不是所有候选的Rj
+   340                                                       # 但是如果k_samples太大，被选中的不同的Rj也会近似于所有候选的Rj，此时性能提升不明显
+   341                                           
+   342        45         25.7      0.6      0.0              t_tr0 = time.time()
+   343        90  167557905.9 1.86e+06     39.6              translated_map, execute_time = self._batch_fetch_translate_bitmaps(
+   344        45         18.3      0.4      0.0                  real_name, 
+   345        45         22.1      0.5      0.0                  pending_bitmap_ids, 
+   346        45         17.1      0.4      0.0                  workload_name=workload_name, 
+   347        45         23.1      0.5      0.0                  alias=alias, 
+   348        45         24.4      0.5      0.0                  pid_map=my_pid_map, 
+   349        45         17.5      0.4      0.0                  global_map=my_global_mask
+   350                                                       )
+   351        45         63.5      1.4      0.0              t_tr1 = time.time()
+   352        45         38.6      0.9      0.0              translate_calls += 1
+   353        45         44.9      1.0      0.0              total_translate_time += (t_tr1 - t_tr0)
+   354        45         32.3      0.7      0.0              execute_query_time += execute_time
+   355                                           
+   356                                                       # 更新 path 状态（计时）
+   357        45         29.2      0.6      0.0              t_up0 = time.time()
+   358        45         26.8      0.6      0.0              update_count = 0
+   359  11192045    4322153.4      0.4      1.0              for i, chosen in path_selections.items():
+   360  11192000    4256201.6      0.4      1.0                  path = active_paths[i]
+   361  11192000    6364486.3      0.6      1.5                  chosen_id = chosen.get(f"{alias}.id") or chosen.get(f"{alias}.Id")
+   362  11192000    5151155.7      0.5      1.2                  qid_mask = translated_map.get(chosen_id, my_global_mask)
+   363  11192000    6130172.7      0.5      1.4                  path['acc_bmp'] &= qid_mask
+   364  11192000    7042542.5      0.6      1.7                  path['vals'].update(chosen)
+   365  11192000    4491263.3      0.4      1.1                  update_count += 1
+   366  11192000    4153096.9      0.4      1.0                  if step_idx == 0:
+   367   4498500    1682173.8      0.4      0.4                      path['rj_data'] = chosen
+   368   4498500    1635603.1      0.4      0.4                      path['rj_bmp'] = qid_mask
+   369        45        185.3      4.1      0.0              t_up1 = time.time()
+   370        45         89.8      2.0      0.0              total_update_paths_time += (t_up1 - t_up0)
+   371        45         30.9      0.7      0.0              total_update_count += update_count
+   372                                           
+   373                                                   # 聚合结果
+   374        18         22.1      1.2      0.0          proposed_candidates = []
+   375                                                   # 结构: { (t_idx, rj_id): {'score': max_score, 'rj_data': data, 'rj_bmp': bmp} }
+   376        18         13.5      0.8      0.0          best_results = {}
+   377                                           
+   378        18         29.2      1.6      0.0          rj_alias = lookahead_plan[0]['alias']
+   379        18         17.8      1.0      0.0          rj_pk_key = f"{rj_alias}.id"
+   380                                                   
+   381                                                   # 遍历所有wander join结果
+   382                                                   # 聚合结果（计时）
+   383        18         17.9      1.0      0.0          t_ag0 = time.time()
+   384        18         10.9      0.6      0.0          wander_success_count = 0
+   385   4498518    1894154.5      0.4      0.4          for path in active_paths:
+   386   4498500    2348200.0      0.5      0.6              if path['alive'] and path['rj_data'] is not None:
+   387   4446500    2012695.7      0.5      0.5                  wander_success_count += 1
+   388   4446500    2027937.1      0.5      0.5                  rj_pk = path['rj_data'][rj_pk_key]
+   389   4446500    2035048.5      0.5      0.5                  key = (path['t_idx'], rj_pk)
+   390                                           
+   391   4446500    5574785.1      1.3      1.3                  score = bin(path['acc_bmp'] & uncovered_mask_int).count('1')
+   392                                                           
+   393   4446500    2541251.9      0.6      0.6                  if key not in best_results or score > best_results[key]['score']:
+   394     53606      50579.5      0.9      0.0                      best_results[key] = {
+   395     53606      25694.6      0.5      0.0                          'score': score,
+   396     53606      27477.8      0.5      0.0                          'rj_data': path['rj_data'],
+   397     53606      30330.8      0.6      0.0                          'rj_bmp': path['rj_bmp']
+   398                                                               }
+   399        18         68.1      3.8      0.0          t_ag1 = time.time()
+   400        18         32.3      1.8      0.0          total_aggregation_time += (t_ag1 - t_ag0)
+   401                                           
+   402                                                   # 格式化输出
+   403     50643      24848.3      0.5      0.0          for (t_idx, rj_id), res in best_results.items():
+   404    101250     215389.6      2.1      0.1              proposed_candidates.append({
+   405     50625      19604.6      0.4      0.0                  't_idx': t_idx,
+   406     50625      23534.8      0.5      0.0                  'rj_data': res['rj_data'], # 所需要的Rj的所有数据
+   407     50625      22183.9      0.4      0.0                  'rj_bmp': res['rj_bmp'],
+   408     50625      20222.4      0.4      0.0                  'score': res['score']
+   409                                                       })
+   410                                           
+   411        18        913.6     50.8      0.0          print(f"                _batch_fetch_neighbors called {batch_fetch_calls} times, total time: {total_batch_fetch_time:.4f}s")
+   412        18        113.0      6.3      0.0          print(f"                _translate_pid_bitmap called {translate_calls} times, total time: {total_translate_time:.4f}s")
+   413                                                   # # 新增详细计时输出
+   414                                                   # print(f"                init active_paths time: {total_init_active_paths_time:.6f}s")
+   415                                                   # print(f"                build batch_vals total time: {total_build_batch_vals_time:.6f}s, total batch_vals collected: {total_batch_vals}")
+   416                                                   # print(f"                selection total time: {total_selection_time:.6f}s, candidates chosen: {total_candidates_chosen}")
+   417                                                   # print(f"                update paths total time: {total_update_paths_time:.6f}s, updates applied: {total_update_count}")
+   418                                                   # print(f"                aggregation time: {total_aggregation_time:.6f}s")
+   419                                                   # print(f"                wander join success count: {wander_success_count}, success rate: {wander_success_count/len(active_paths) if active_paths else 0:.4f}")
+   420                                           
+   421        18         16.7      0.9      0.0          return proposed_candidates, execute_query_time
+
+423.24 seconds - /data2/xuyining/Sampler/join_sampling/v3_wanderjoin/wander_join.py:208 - sample_beam_extensions

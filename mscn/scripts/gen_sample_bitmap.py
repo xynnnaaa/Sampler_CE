@@ -4,10 +4,9 @@ import os
 import sys
 from pathlib import Path
 import glob
+import networkx as nx
+from networkx.readwrite import json_graph
 import sys
-print(sys.path)
-
-from query_representation.query import load_qrep, get_tables, get_predicates
 
 
 DB_CONNECT_PARAMS = {
@@ -17,13 +16,24 @@ DB_CONNECT_PARAMS = {
     "user": "imdb"
 }
 
-QREP_BASE_DIR = "./queries/ceb-imdb"
-OUTPUT_DIR = "./queries/sample_bitmaps/ceb-imdb"
+QREP_BASE_DIR = "/data2/xuyining/Sampler/mscn/queries/ceb-imdb"
+OUTPUT_DIR = "/data2/xuyining/Sampler/mscn/queries/default_bitmap/1000/ceb-imdb"
 
-SAMPLE_SIZE = 70
+SAMPLE_SIZE = 1000
 SAMPLE_TABLE_PREFIX = "sample_"
 
 PRIMARY_KEY_COL = "id"  # assuming every table has a primary key column named 'id'
+
+def load_qrep(fn):
+    assert ".pkl" in fn
+    with open(fn, "rb") as f:
+        query = pickle.load(f)
+
+    query["subset_graph"] = \
+            nx.OrderedDiGraph(json_graph.adjacency_graph(query["subset_graph"]))
+    query["join_graph"] = json_graph.adjacency_graph(query["join_graph"])
+
+    return query
 
 def execute_query(conn, query):
     try:
@@ -116,9 +126,9 @@ def main():
         "movie_keyword", "movie_link", "name", "person_info", "role_type", "title"
     ]
 
-    check_tables_for_pk(conn, all_unique_tables)
+    # check_tables_for_pk(conn, all_unique_tables)
 
-    create_sample_tables(conn, all_unique_tables)
+    # create_sample_tables(conn, all_unique_tables)
 
     for qrep_file in qrep_files:
         total_queries += 1
@@ -136,7 +146,8 @@ def main():
             
             current_query_bitmap = {}
             for alias, table_name in tables_by_alias.items():
-                sample_table = SAMPLE_TABLE_PREFIX + table_name + "_" + str(SAMPLE_SIZE)
+                # sample_table = SAMPLE_TABLE_PREFIX + table_name + "_" + str(SAMPLE_SIZE)
+                sample_table = table_name + "_s1000"
                 predicate_list = preds_by_alias.get(alias, [])
                 if predicate_list:
                     where_clause = " AND ".join(f"({p})" for p in predicate_list)

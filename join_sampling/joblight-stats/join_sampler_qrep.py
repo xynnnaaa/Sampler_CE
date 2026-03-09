@@ -170,111 +170,106 @@ class JoinSampler:
         temp_groups = defaultdict(list)
         temp_graphs = {}
 
-        try:
-            template_names = [d for d in os.listdir(self.base_query_dir) if os.path.isdir(os.path.join(self.base_query_dir, d))]
-        except FileNotFoundError:
-            print(f"ERROR: Base query directory not found: {self.base_query_dir}")
-            return
+        pkl_files = sorted(glob.glob(os.path.join(self.base_query_dir, "*.pkl")))
+
+        # pkl_files_1 = sorted(glob.glob(os.path.join("/data2/xuyining/Sampler/join_sampling/joblight-stats/stats/train/qrep", "*.pkl")))
+        # pkl_files_2 = sorted(glob.glob(os.path.join("/data2/xuyining/Sampler/mscn/queries/stats-ceb/end_to_end", "*.pkl")))
+        # pkl_files = pkl_files_1 + pkl_files_2
         
-        if not template_names:
-            print(f"No template subdirectories found in '{self.base_query_dir}'.")
-            return
-        
-        for template_name in sorted(template_names):
-            if template_name == "7a" and self.skip_7a:
-                print("Skipping template '7a' as per configuration.")
-                continue  # Skip known problematic template
-            input_template_dir = os.path.join(self.base_query_dir, template_name)
-            pkl_files = sorted(glob.glob(os.path.join(input_template_dir, "*.pkl")))
-            if not pkl_files:
-                print(f"No .pkl files found in '{input_template_dir}'. Skipping this template.")
+        for pkl_file in pkl_files:
+            try:
+                qrep = load_qrep(pkl_file)
+            except Exception as e:
+                print(f"Error loading {pkl_file}: {e}")
                 continue
-            for pkl_file in pkl_files:
-                try:
-                    qrep = load_qrep(pkl_file)
-                except Exception as e:
-                    print(f"Error loading {pkl_file}: {e}")
+
+            join_graph = qrep["join_graph"]
+            subset_graph = qrep["subset_graph"]
+
+            for subplan_tuple in sorted(subset_graph.nodes()):
+                # check 这里跳过了单表template
+                if len(subplan_tuple) < 2:
                     continue
 
-                join_graph = qrep["join_graph"]
-                subset_graph = qrep["subset_graph"]
+                sorted_aliases = sorted(list(subplan_tuple))
+                sub_graph = join_graph.subgraph(subplan_tuple)
+                edges_info = []
 
-                for subplan_tuple in sorted(subset_graph.nodes()):
-                    # check 这里跳过了单表template
-                    if len(subplan_tuple) < 2:
+                for u, v, data in sub_graph.edges(data=True):
+                    if u > v:
+                        u, v = v, u
+
+                    cond = data.get("join_condition", "")
+                    if not cond:
+                        print(f"Warning: No join condition found between {u} and {v} in {pkl_file}")
                         continue
 
-                    sorted_aliases = sorted(list(subplan_tuple))
-                    sub_graph = join_graph.subgraph(subplan_tuple)
-                    edges_info = []
+                    cond_clean = normalize_condition(cond)
+                    edges_info.append(f"{u}|{v}|{cond_clean}")
 
-                    for u, v, data in sub_graph.edges(data=True):
-                        if u > v:
-                            u, v = v, u
+                edges_info.sort()
+                join_sig_str = "||".join(edges_info)
 
-                        cond = data.get("join_condition", "")
-                        if not cond:
-                            print(f"Warning: No join condition found between {u} and {v} in {pkl_file}")
-                            continue
+                template_key = (tuple(sorted_aliases), join_sig_str)
 
-                        cond_clean = normalize_condition(cond)
-                        edges_info.append(f"{u}|{v}|{cond_clean}")
+                # 存储当前查询的谓词-PID 映射
+                current_query_pids = {} # {alias: pid}
 
-                    edges_info.sort()
-                    join_sig_str = "||".join(edges_info)
+                for alias in sorted_aliases:
+                    node_data = join_graph.nodes[alias]
+                    real_name = node_data["real_name"]
 
-                    template_key = (tuple(sorted_aliases), join_sig_str)
+                    self.all_involved_tables.add(real_name)
 
-                    # 存储当前查询的谓词-PID 映射
-                    current_query_pids = {} # {alias: pid}
+                    preds_list = node_data.get("predicates", [])
 
-                    for alias in sorted_aliases:
-                        node_data = join_graph.nodes[alias]
-                        real_name = node_data["real_name"]
+                    clean_pred_list = [] # 没有别名的谓词
+                    for pred in preds_list:
+                        pattern = fr"\b{alias}\."
+                        pred_clean = re.sub(pattern, "", pred).strip()
+                        clean_pred_list.append(pred_clean)
 
-                        self.all_involved_tables.add(real_name)
+                    if clean_pred_list:
+                        combined_pred = " AND ".join(clean_pred_list)
+                        if combined_pred not in self.global_predicate_map[real_name]:
+                            pid = self.global_pid_counters[real_name]
+                            # 从0开始编号
+                            self.global_predicate_map[real_name][combined_pred] = pid
+                            self.global_pid_counters[real_name] += 1
 
-                        preds_list = node_data.get("predicates", [])
+                        # 这里存 pid，不用存字符串了
+                        current_pid = self.global_predicate_map[real_name][combined_pred]
+                        current_query_pids[alias] = current_pid
+                    else:
+                        current_query_pids[alias] = -1  # 表示没有谓词
 
-                        clean_pred_list = [] # 没有别名的谓词
-                        for pred in preds_list:
-                            pattern = fr"\b{alias}\."
-                            pred_clean = re.sub(pattern, "", pred).strip()
-                            clean_pred_list.append(pred_clean)
+                temp_groups[template_key].append(current_query_pids)
 
-                        if clean_pred_list:
-                            combined_pred = " AND ".join(clean_pred_list)
-                            if combined_pred not in self.global_predicate_map[real_name]:
-                                pid = self.global_pid_counters[real_name]
-                                # 从0开始编号
-                                self.global_predicate_map[real_name][combined_pred] = pid
-                                self.global_pid_counters[real_name] += 1
-
-                            # 这里存 pid，不用存字符串了
-                            current_pid = self.global_predicate_map[real_name][combined_pred]
-                            current_query_pids[alias] = current_pid
-                        else:
-                            current_query_pids[alias] = -1  # 表示没有谓词
-
-                    temp_groups[template_key].append(current_query_pids)
-
-                    if template_key not in temp_graphs:
-                        # 创建子图副本，保留边上的连接条件信息
-                        temp_graphs[template_key] = sub_graph.copy()
+                if template_key not in temp_graphs:
+                    # 创建子图副本，保留边上的连接条件信息
+                    temp_graphs[template_key] = sub_graph.copy()
 
         print(f"Parsing complete. Found {len(temp_groups)} distinct join templates.")
 
         print("Global Predicate Map Summary:")
         for real_table, pred_map in self.global_predicate_map.items():
             print(f"  Table '{real_table}': {len(pred_map)} unique predicates.")
+            if real_table == "posts":
+                # 按照pred_sql排序输出
+                pred_map = dict(sorted(pred_map.items()))
+                for pred_sql, pid in pred_map.items():
+                    print(f"    {pred_sql}")
 
          # 构建最终的 join_templates 结构
         for template_key, query_list in temp_groups.items():
+            # print(f"Processing template: Aliases={template_key[0]}, Join sig={template_key[1]}, Query Count={len(query_list)}")
             aliases_tuple, join_sig = template_key
 
             import hashlib
             sig_hash = hashlib.md5(join_sig.encode('utf-8')).hexdigest()[:6]
             template_id = f"{'_'.join(aliases_tuple)}_{sig_hash}"
+
+            # print(template_id)
             
             sub_graph = temp_graphs[template_key]
             num_queries = len(query_list)
@@ -298,8 +293,11 @@ class JoinSampler:
                 "table_pids": dict(table_pid_map)
             }
 
-        # 将join_templates按照alias个数升序排列
-        # self.join_templates = dict(sorted(self.join_templates.items(), key=lambda item: len(item[1]['aliases'])))
+        # 将join_templates按照aliases字典序排序，保证每次运行的顺序一致
+        # self.join_templates = dict(sorted(self.join_templates.items(), key=lambda x: x[1]['aliases']))
+
+        # for template_id, template_data in self.join_templates.items():
+        #     print(f"Template ID: {template_id}")
 
 
     def prepare_pid_to_qid_map(self, template_data):

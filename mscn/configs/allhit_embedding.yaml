@@ -12,7 +12,7 @@ eval:
 data:
     query_dir: "./queries/ceb-imdb"
     eval_query_dir: ""
-    bitmap_dir: "./queries/embedding_bitmap/default/1000"
+    bitmap_dir: "./queries/embedding_bitmap/allhit/1000"
 
     # query_dir: "./queries/ceb-imdb"
     # eval_query_dir: ""
@@ -124,7 +124,7 @@ model:
   max_epochs : 2000
   eval_epoch : 4 # how often to evaluate on eval_fns during training
   eval_fns : "qerr" # logging things during training
-  lr : 0.0001
+  lr : 0.001
   num_hidden_layers : 2
   hidden_layer_size : 128
 

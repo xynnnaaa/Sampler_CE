@@ -35,6 +35,8 @@ def eval_alg(alg, eval_funcs, qreps, cfg,
 
     ests = alg.test(qreps)
 
+    print("Finished getting estimates for {} samples in: {}".format(samples_type, time.time()-start))
+
     rdir = None
     if args.result_dir is not None:
         rdir = os.path.join(args.result_dir, exp_name)

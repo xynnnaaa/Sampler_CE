@@ -1364,8 +1364,8 @@ def extract_join_graph(sql):
     join_graph = nx.Graph()
 
     for j in joins:
-        j1 = j.split("=")[0]
-        j2 = j.split("=")[1]
+        j1 = j.split("=")[0].replace("(", "").replace(")", "")
+        j2 = j.split("=")[1].replace("(", "").replace(")", "")
         t1 = j1[0:j1.find(".")].strip()
         t2 = j2[0:j2.find(".")].strip()
         try:

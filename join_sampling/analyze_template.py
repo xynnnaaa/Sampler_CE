@@ -533,24 +533,28 @@ class WorkloadAnalyzer:
 
 if __name__ == "__main__":
     # BASE_DIR = "/data1/xuyining/CEB/my_queries_all/half_ceb_full"
-    BASE_DIR = "/data2/xuyining/Sampler/mscn/queries/ceb-imdb"
+    # BASE_DIR = "/data2/xuyining/Sampler/mscn/queries/ceb-imdb"
+
     # BASE_DIR = "/data1/xuyining/Sampler/mscn/queries/joblight_train/joblight-train-all"
+    BASE_DIR = "/data2/xuyining/Sampler/mscn/queries/stats-ceb"
     
     analyzer = WorkloadAnalyzer(BASE_DIR, skip_7a=True)
 
     t1 = time.time()
     
-    analyzer.load_and_group_workload_ceb()
+    # analyzer.load_and_group_workload_ceb()
+
+    analyzer.load_and_group_workload_job()
 
     print(f"Load and parse workload in {time.time() - t1:.2f}s.")
 
-    t2 = time.time()
+    # t2 = time.time()
 
-    if analyzer.unique_templates:
-        analyzer.build_trie_and_count()
-    else:
-        print("No templates found to analyze.")
+    # if analyzer.unique_templates:
+    #     analyzer.build_trie_and_count()
+    # else:
+    #     print("No templates found to analyze.")
 
-    print(f"Build trie and count leaves in {time.time() - t2:.2f}s.")
+    # print(f"Build trie and count leaves in {time.time() - t2:.2f}s.")
 
     # analyzer.analyze_all_templates()

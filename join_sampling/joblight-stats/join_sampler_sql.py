@@ -1,6 +1,25 @@
+import sys
+import os
+
+# 获取当前脚本所在目录: .../Sampler/join_sampling/joblight-stats
+curr_dir = os.path.dirname(os.path.abspath(__file__))
+
+# 1. 定位到 Sampler 根目录 (../../)
+project_root = os.path.abspath(os.path.join(curr_dir, "../../"))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+# 2. 定位到 mscn 目录 (.../Sampler/mscn)
+# 这一步是为了让 query.py 里的 "from query_representation" 能够被解析
+mscn_root = os.path.join(project_root, "mscn")
+if mscn_root not in sys.path:
+    sys.path.append(mscn_root)
+
+# --- 现在再进行你的业务导入 ---
+from mscn.query_representation.utils import *
+
 import pickle
 import glob
-import os
 import io
 from collections import defaultdict
 from networkx.readwrite import json_graph
@@ -9,7 +28,6 @@ import time
 import json
 import psycopg2
 from psycopg2.extras import execute_values
-import sys
 import re
 import heapq
 
@@ -18,6 +36,7 @@ from sqlglot import exp
 
 # [Added] Import the Engine
 from wander_join import WanderJoinEngine
+
 
 def load_qrep(fn):
     assert ".pkl" in fn
@@ -36,6 +55,45 @@ def normalize_condition(cond_str):
     parts = [p.strip() for p in cond_str.split('=')]
     parts.sort()
     return "=".join(parts)
+
+import re
+
+def remove_unnecessary_parentheses(sql_str):
+    """
+    预处理 SQL，专门剥离 WHERE 条件中每个谓词最外层的括号，并删去末尾分号
+    例如：将 WHERE (A = B) AND ((C = D)) 转换为 WHERE A = B AND C = D
+    注意：不会影响 SELECT COUNT(*) 中的括号，也不会影响 IN (1, 2) 的括号。
+    """
+    # 1. 找到 WHERE 的位置 (忽略大小写)
+    match = re.search(r'\bWHERE\b', sql_str, re.IGNORECASE)
+    if not match:
+        return sql_str  # 如果没有 WHERE 子句，直接返回
+    
+    where_idx = match.end()
+    select_from_part = sql_str[:where_idx] # "SELECT ... FROM ... WHERE"
+    where_part = sql_str[where_idx:]       # " (a=b) AND (c=d);"
+    
+    # 2. 提取并暂时移除末尾的分号（如果有）
+    where_part = where_part.strip()
+    has_semicolon = where_part.endswith(";")
+    if has_semicolon:
+        where_part = where_part[:-1].strip()
+        
+    # 3. 按 AND 切分所有的谓词条件 (忽略大小写)
+    conditions = re.split(r'\s+AND\s+', where_part, flags=re.IGNORECASE)
+    
+    # 4. 剥离每个条件最外层的括号
+    clean_conditions = []
+    for cond in conditions:
+        cond = cond.strip()
+        # 循环剥离，应对像 ((a.id = b.id)) 这种嵌套的多重括号
+        while cond.startswith("(") and cond.endswith(")"):
+            cond = cond[1:-1].strip()
+        clean_conditions.append(cond)
+        
+    # 5. 重新使用 AND 拼装起来
+    new_where = " AND ".join(clean_conditions)
+    return select_from_part + " " + new_where
 
 TABLE_CARD = {
     "cast_info": 37610440,
@@ -72,10 +130,9 @@ class JoinSampler:
             self.config = json.load(f)
         
         samp_conf = self.config.get("sampling", {})
-        self.base_query_dir = samp_conf.get("base_query_dir", "./qrep")
+        self.sql_file = samp_conf.get("query_file", "./qrep")
         self.workload_name = samp_conf.get("workload_name", "")
         self.output_path = samp_conf.get("output_path", "./samples.json")
-        self.skip_7a = samp_conf.get("skip_7a", True)
 
         self.m_partitions = samp_conf.get("m_partitions", 10)
         self.k_bitmaps = samp_conf.get("k_bitmaps", 5)
@@ -87,10 +144,9 @@ class JoinSampler:
         self.lookahead_samples = samp_conf.get("lookahead_samples", 500) # 采样次数
 
         print("Configuration Loaded:")
-        print(f"  Base Query Directory: {self.base_query_dir}")
+        print(f"  Query File: {self.sql_file}")
         print(f"  Workload Name: {self.workload_name}")
         print(f"  Output Path: {self.output_path}")
-        print(f"  Skip Template '7a': {self.skip_7a}")
         print(f"  M Partitions: {self.m_partitions}")
         print(f"  K Bitmaps: {self.k_bitmaps}")
         print(f"  Limit X: {self.limit_x}")
@@ -171,96 +227,132 @@ class JoinSampler:
         temp_graphs = {}
 
         try:
-            template_names = [d for d in os.listdir(self.base_query_dir) if os.path.isdir(os.path.join(self.base_query_dir, d))]
-        except FileNotFoundError:
-            print(f"ERROR: Base query directory not found: {self.base_query_dir}")
+            with open(self.sql_file, 'r') as f:
+                lines = f.readlines()
+        except Exception as e:
+            print(f"Error loading {self.sql_file}: {e}")
             return
+
+        # try:
+        #     with open("/data2/xuyining/PRICE/datas/workloads/test/stats/workloads.sql", 'r') as f:
+        #         lines_1 = f.readlines()
+        # except Exception as e:
+        #     print(f"Error loading {self.sql_file}: {e}")
+        #     return
         
-        if not template_names:
-            print(f"No template subdirectories found in '{self.base_query_dir}'.")
-            return
+        # try:
+        #     with open("/data2/xuyining/PRICE/datas/workloads/finetune/stats/workloads.sql", 'r') as f:
+        #         lines_2 = f.readlines()
+        # except Exception as e:
+        #     print(f"Error loading {self.sql_file}: {e}")
+        #     return
         
-        for template_name in sorted(template_names):
-            if template_name == "7a" and self.skip_7a:
-                print("Skipping template '7a' as per configuration.")
-                continue  # Skip known problematic template
-            input_template_dir = os.path.join(self.base_query_dir, template_name)
-            pkl_files = sorted(glob.glob(os.path.join(input_template_dir, "*.pkl")))
-            if not pkl_files:
-                print(f"No .pkl files found in '{input_template_dir}'. Skipping this template.")
+        # lines = lines_1 + lines_2
+        
+        for line_idx, line in enumerate(lines):
+            line = line.strip()
+            if not line:
                 continue
-            for pkl_file in pkl_files:
-                try:
-                    qrep = load_qrep(pkl_file)
-                except Exception as e:
-                    print(f"Error loading {pkl_file}: {e}")
+            parts = line.split("||")
+            sql_str = parts[0].strip()
+
+            # 如果sql中最前面有/* (st_u) */ 这种注释，去掉它
+            if sql_str.startswith("/*"):
+                sql_str = sql_str.split("*/", 1)[-1].strip()
+
+            if "SELECT" not in sql_str.upper():
+                continue
+
+            try:
+                sql_str = remove_unnecessary_parentheses(sql_str)
+                # 直接提取 join_graph，跳过 subset_graph 的生成和序列化
+                join_graph = extract_join_graph(sql_str)
+            except Exception as e:
+                print(f"Error parsing SQL at line {line_idx}: {e}")
+                continue
+
+            sorted_aliases = sorted(list(join_graph.nodes()))
+            subplan_tuple = tuple(sorted_aliases)
+
+            if len(subplan_tuple) < 2:
+                continue
+
+            sub_graph = join_graph
+
+            # add: 构建列级等价类，用于template key生成
+            col_graph = nx.Graph()
+
+            for u, v, data in sub_graph.edges(data=True):
+                if u > v:
+                    u, v = v, u
+
+                cond = data.get("join_condition", "")
+                if not cond:
+                    print(f"Warning: No join condition found between {u} and {v} in {self.pkl_file}")
                     continue
 
-                join_graph = qrep["join_graph"]
-                subset_graph = qrep["subset_graph"]
+                cond_clean = normalize_condition(cond)
+                parts = cond_clean.split("=")
+                if len(parts) != 2:
+                    print(f"Warning: Unexpected join condition format '{cond_clean}' between {u} and {v} in {self.pkl_file}")
+                    continue
+                left, right = parts[0].strip(), parts[1].strip()
+                col_graph.add_edge(left, right)
 
-                for subplan_tuple in sorted(subset_graph.nodes()):
-                    # check 这里跳过了单表template
-                    if len(subplan_tuple) < 2:
-                        continue
+            # 生成等价类
+            eq_classes = list(nx.connected_components(col_graph))
 
-                    sorted_aliases = sorted(list(subplan_tuple))
-                    sub_graph = join_graph.subgraph(subplan_tuple)
-                    edges_info = []
+            class_signatures = []
+            for eq_class in eq_classes:
+                sorted_cols = sorted(list(eq_class))
+                class_signatures.append("=".join(sorted_cols))
+            class_signatures.sort()
+            join_sig_str = "||".join(class_signatures)
 
-                    for u, v, data in sub_graph.edges(data=True):
-                        if u > v:
-                            u, v = v, u
+            template_key = (tuple(sorted_aliases), join_sig_str)
 
-                        cond = data.get("join_condition", "")
-                        if not cond:
-                            print(f"Warning: No join condition found between {u} and {v} in {pkl_file}")
-                            continue
+            # 存储当前查询的谓词-PID 映射
+            current_query_pids = {} # {alias: pid}
 
-                        cond_clean = normalize_condition(cond)
-                        edges_info.append(f"{u}|{v}|{cond_clean}")
+            for alias in sorted_aliases:
+                node_data = join_graph.nodes[alias]
+                real_name = node_data["real_name"]
 
-                    edges_info.sort()
-                    join_sig_str = "||".join(edges_info)
+                self.all_involved_tables.add(real_name)
 
-                    template_key = (tuple(sorted_aliases), join_sig_str)
+                preds_list = node_data.get("predicates", [])
 
-                    # 存储当前查询的谓词-PID 映射
-                    current_query_pids = {} # {alias: pid}
+                # 排序
+                preds_list = sorted(preds_list)
 
-                    for alias in sorted_aliases:
-                        node_data = join_graph.nodes[alias]
-                        real_name = node_data["real_name"]
+                clean_pred_list = [] # 没有别名的谓词
+                for pred in preds_list:
+                    pattern = fr"\b{alias}\."
+                    pred_clean = re.sub(pattern, "", pred).strip()
 
-                        self.all_involved_tables.add(real_name)
+                    # 去除谓词中操作符两边的多余空格，例如 "kind_id = 1" -> "kind_id=1"
+                    pred_clean = re.sub(r'\s*([<>=!]+)\s*', r'\1', pred_clean)
+                    clean_pred_list.append(pred_clean)
 
-                        preds_list = node_data.get("predicates", [])
+                if clean_pred_list:
+                    combined_pred = " AND ".join(clean_pred_list)
+                    if combined_pred not in self.global_predicate_map[real_name]:
+                        pid = self.global_pid_counters[real_name]
+                        # 从0开始编号
+                        self.global_predicate_map[real_name][combined_pred] = pid
+                        self.global_pid_counters[real_name] += 1
 
-                        clean_pred_list = [] # 没有别名的谓词
-                        for pred in preds_list:
-                            pattern = fr"\b{alias}\."
-                            pred_clean = re.sub(pattern, "", pred).strip()
-                            clean_pred_list.append(pred_clean)
+                    # 这里存 pid，不用存字符串了
+                    current_pid = self.global_predicate_map[real_name][combined_pred]
+                    current_query_pids[alias] = current_pid
+                else:
+                    current_query_pids[alias] = -1  # 表示没有谓词
 
-                        if clean_pred_list:
-                            combined_pred = " AND ".join(clean_pred_list)
-                            if combined_pred not in self.global_predicate_map[real_name]:
-                                pid = self.global_pid_counters[real_name]
-                                # 从0开始编号
-                                self.global_predicate_map[real_name][combined_pred] = pid
-                                self.global_pid_counters[real_name] += 1
+            temp_groups[template_key].append(current_query_pids)
 
-                            # 这里存 pid，不用存字符串了
-                            current_pid = self.global_predicate_map[real_name][combined_pred]
-                            current_query_pids[alias] = current_pid
-                        else:
-                            current_query_pids[alias] = -1  # 表示没有谓词
-
-                    temp_groups[template_key].append(current_query_pids)
-
-                    if template_key not in temp_graphs:
-                        # 创建子图副本，保留边上的连接条件信息
-                        temp_graphs[template_key] = sub_graph.copy()
+            if template_key not in temp_graphs:
+                # 创建子图副本，保留边上的连接条件信息
+                temp_graphs[template_key] = sub_graph.copy()
 
         print(f"Parsing complete. Found {len(temp_groups)} distinct join templates.")
 
@@ -270,6 +362,8 @@ class JoinSampler:
 
          # 构建最终的 join_templates 结构
         for template_key, query_list in temp_groups.items():
+            print(f"Template {template_key} with {len(query_list)} queries...")
+
             aliases_tuple, join_sig = template_key
 
             import hashlib
@@ -886,19 +980,6 @@ class JoinSampler:
         # for template_id, template_data in my_tasks:
         #     if len(template_data['aliases']) < 2:
         #         # print(f"\n=== Skipping Template: {template_id} (only {len(template_data['aliases'])} table) ===")
-        #         continue
-
-        #     # if "mi1" in template_data['aliases'] or "mi2" in template_data['aliases'] or "ci" in template_data['aliases']:
-        #     #     # print(f"\n=== Skipping Template: {template_id} (contains problematic table) ===")
-        #     #     continue
-
-        #     # if "it1" not in template_data['aliases'] and "it2" not in template_data['aliases']:
-        #     #     continue
-
-        #     # if len(template_data['aliases']) < 3:
-        #     #     continue
-
-        #     if template_id != "ci_it1_kt_mi1_n_rt_t_7a3dbd":
         #         continue
 
         #     print(f"\n=== Processing Template: {template_id} ===")
