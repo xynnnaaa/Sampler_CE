@@ -1,5 +1,6 @@
 import sys
 import os
+import datetime
 
 # 获取当前脚本所在目录: .../Sampler/join_sampling/joblight-stats
 curr_dir = os.path.dirname(os.path.abspath(__file__))
@@ -58,6 +59,33 @@ def normalize_condition(cond_str):
 
 import re
 
+def timestamp_to_string(timestamp_str):
+    # 将时间戳字符串转换为整数
+    unix_timestamp = int(timestamp_str)
+    
+    # 将 Unix 时间戳转换为 datetime 对象
+    dt = datetime.datetime.fromtimestamp(unix_timestamp)
+    
+    # 将 datetime 对象格式化为时间字符串
+    timestamp_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+    
+    return timestamp_str
+
+def convert_timestamps_in_sql(sql):
+    # 使用正则表达式匹配形如 alias.column op value 的谓词，其中 column 以 date 或 Date 结尾，value 是数字
+    pattern = r'(\w+\.(\w+))\s*([<>=!]+)\s*(\d+)'
+    def replace_match(match):
+        full_col = match.group(1)
+        col_name = match.group(2)
+        op = match.group(3)
+        value = match.group(4)
+        if col_name.endswith('date') or col_name.endswith('Date'):
+            converted_value = timestamp_to_string(value)
+            return f"{full_col} {op} '{converted_value}'::timestamp"
+        else:
+            return match.group(0)
+    return re.sub(pattern, replace_match, sql)
+
 def remove_unnecessary_parentheses(sql_str):
     """
     预处理 SQL，专门剥离 WHERE 条件中每个谓词最外层的括号，并删去末尾分号
@@ -95,6 +123,7 @@ def remove_unnecessary_parentheses(sql_str):
     new_where = " AND ".join(clean_conditions)
     return select_from_part + " " + new_where
 
+
 TABLE_CARD = {
     "cast_info": 37610440,
     "movie_info": 13399115,
@@ -119,6 +148,17 @@ TABLE_CARD = {
     "company_type": 4,
 }
 
+TABLE_CARD_STATS = {
+    "badges": 79851,
+    "comments": 174305,
+    "posts": 91976,
+    "users": 40325,
+    "votes": 328064,
+    "posthistory": 303187,
+    "postlinks": 11102,
+    "tags": 1032,
+}
+
 class JoinSampler:
     def __init__(self, config_path: str):
         print(f"Initializing JoinSampler with config: {config_path}")
@@ -138,6 +178,8 @@ class JoinSampler:
         self.k_bitmaps = samp_conf.get("k_bitmaps", 5)
         self.limit_x = samp_conf.get("limit_x", 50)
         self.batch_size = samp_conf.get("batch_size", 1000)
+
+        self.use_cpp = samp_conf.get("use_cpp", 0)
         
         # [Added] Lookahead configuration
         self.lookahead_k = samp_conf.get("lookahead_k", 5) # 向后看几步
@@ -152,10 +194,14 @@ class JoinSampler:
         print(f"  Limit X: {self.limit_x}")
         print(f"  Lookahead K: {self.lookahead_k}")
         print(f"  Lookahead Samples: {self.lookahead_samples}")
+        print(f"  Use C++ Engine: {'Yes' if self.use_cpp else 'No'}")
 
         self.join_templates = {}
         self.global_predicate_map = defaultdict(lambda: {}) 
-        self.global_pid_counters = defaultdict(int)         
+        self.global_pid_counters = defaultdict(int)
+
+        # debug 反向映射字典：用于从 PID 恢复字符串
+        self.global_pid_to_pred = defaultdict(dict)  
 
         db_conf = self.config.get("database", {})
         self.db_config = {
@@ -234,14 +280,14 @@ class JoinSampler:
             return
 
         # try:
-        #     with open("/data2/xuyining/PRICE/datas/workloads/test/stats/workloads.sql", 'r') as f:
+        #     with open("/data2/xuyining/PRICE/datas/workloads/test/imdb/workloads.sql", 'r') as f:
         #         lines_1 = f.readlines()
         # except Exception as e:
         #     print(f"Error loading {self.sql_file}: {e}")
         #     return
         
         # try:
-        #     with open("/data2/xuyining/PRICE/datas/workloads/finetune/stats/workloads.sql", 'r') as f:
+        #     with open("/data2/xuyining/PRICE/datas/workloads/finetune/imdb/workloads.sql", 'r') as f:
         #         lines_2 = f.readlines()
         # except Exception as e:
         #     print(f"Error loading {self.sql_file}: {e}")
@@ -327,6 +373,11 @@ class JoinSampler:
 
                 clean_pred_list = [] # 没有别名的谓词
                 for pred in preds_list:
+
+                    # stats 数据集时间戳转换
+                    if "stats" in self.db_config.get("dbname", "").lower():
+                        pred = convert_timestamps_in_sql(pred)
+
                     pattern = fr"\b{alias}\."
                     pred_clean = re.sub(pattern, "", pred).strip()
 
@@ -341,6 +392,7 @@ class JoinSampler:
                         # 从0开始编号
                         self.global_predicate_map[real_name][combined_pred] = pid
                         self.global_pid_counters[real_name] += 1
+                        self.global_pid_to_pred[real_name][pid] = combined_pred
 
                     # 这里存 pid，不用存字符串了
                     current_pid = self.global_predicate_map[real_name][combined_pred]
@@ -348,7 +400,8 @@ class JoinSampler:
                 else:
                     current_query_pids[alias] = -1  # 表示没有谓词
 
-            temp_groups[template_key].append(current_query_pids)
+            # debug 把原始sql一起存入列表
+            temp_groups[template_key].append((current_query_pids, sql_str))
 
             if template_key not in temp_graphs:
                 # 创建子图副本，保留边上的连接条件信息
@@ -362,7 +415,7 @@ class JoinSampler:
 
          # 构建最终的 join_templates 结构
         for template_key, query_list in temp_groups.items():
-            print(f"Template {template_key} with {len(query_list)} queries...")
+            # print(f"Template {template_key} with {len(query_list)} queries...")
 
             aliases_tuple, join_sig = template_key
 
@@ -380,7 +433,11 @@ class JoinSampler:
             # {alias: {q_idx: pid}}
             table_pid_map = defaultdict(dict)
 
-            for q_idx, pids_dict in enumerate(query_list):
+            # debug 存放当前模板下每个查询的原始 SQL
+            raw_queries_list = []
+
+            for q_idx, (pids_dict, raw_sql) in enumerate(query_list):
+                raw_queries_list.append(raw_sql)
                 for alias, pid in pids_dict.items():
                     table_pid_map[alias][q_idx] = pid
             
@@ -389,7 +446,8 @@ class JoinSampler:
                 "real_names": real_names,
                 "join_graph": sub_graph,
                 "queries_count": num_queries,
-                "table_pids": dict(table_pid_map)
+                "table_pids": dict(table_pid_map),
+                "raw_queries": raw_queries_list,  # debug 用
             }
 
         # 将join_templates按照alias个数升序排列
@@ -447,7 +505,8 @@ class JoinSampler:
                     jconds = edge_data["join_condition"].split("=")
                 for jc in jconds:
                     jc = jc.strip()
-                    if node == jc[0:len(node)]:
+                    jc_alias = jc.split(".")[0]
+                    if node == jc_alias:
                         if jc not in sels:
                             sels.append(jc)
                     jc_node = jc.split(".")[0]
@@ -469,11 +528,17 @@ class JoinSampler:
         scored = []
         for a in aliases:
             real_name = join_graph.nodes[a]['real_name']
-            card = TABLE_CARD.get(real_name, float("inf"))
+            if "imdb" in self.db_config.get("dbname", "").lower():
+                card = TABLE_CARD.get(real_name.lower(), float("inf"))
+            elif "stats" in self.db_config.get("dbname", "").lower():
+                card = TABLE_CARD_STATS.get(real_name.lower(), float("inf"))
+            else:
+                print(f"Warning: Unknown database '{self.db_config.get('dbname', '')}', defaulting cardinality to infinity.")
+                card = float("inf")
             scored.append((card, a))
         scored.sort()
 
-        root_table = None
+        root_table = aliases[0]  # 默认第一个表为root
 
         for card, alias in scored:
             if card > 10000:
@@ -481,8 +546,8 @@ class JoinSampler:
                 break
 
         # 2.6 这里新加了特殊处理
-        if len(aliases) <= 4:
-            if root_table is None or root_table == 'ci' or root_table == 'mi1' or root_table == 'mi2':
+        if "imdb" in self.db_config.get("dbname", "").lower():
+            if root_table is None or root_table == 'imdb_ci' or root_table == 'imdb_mi' or root_table == 'imdb_mi' or root_table == 'imdb_pi':
                 root_table = scored[0][1]
 
         visited = {root_table}
@@ -502,7 +567,13 @@ class JoinSampler:
                 for v in sorted(join_graph.neighbors(u)):
                     if v not in visited:
                         real_name = join_graph.nodes[v]['real_name']
-                        card = TABLE_CARD.get(real_name, float("inf"))
+                        if "imdb" in self.db_config.get("dbname", "").lower():
+                            card = TABLE_CARD.get(real_name.lower(), float("inf"))
+                        elif "stats" in self.db_config.get("dbname", "").lower():
+                            card = TABLE_CARD_STATS.get(real_name.lower(), float("inf"))
+                        else:
+                            print(f"Warning: Unknown database '{self.db_config.get('dbname', '')}', defaulting cardinality to infinity.")
+                            card = float("inf")
                         candidates.append((card, u, v))
 
             if not candidates:
@@ -600,8 +671,8 @@ class JoinSampler:
                     print(f"        Skipping '{real_name}': Sidecar '{sidecar_name}' already exists.", flush=True)
                     continue
 
-                # self.cursor.execute(f"DROP TABLE IF EXISTS {sidecar_name}")
-                # self.conn.commit()
+                self.cursor.execute(f"DROP TABLE IF EXISTS {sidecar_name}")
+                self.conn.commit()
 
                 create_sql = f"""
                     CREATE TABLE {sidecar_name} AS
@@ -750,16 +821,24 @@ class JoinSampler:
                 'score': score
             })
 
-        # root剪枝
+        if not current_beam: return None, 0.0
+
+        # root剪枝，添加扰动
         current_beam.sort(key=lambda x: x['score'], reverse=True)
-        current_beam = current_beam[:limit_x]
+
+        import random
+        # 所有分数最高的 root candidates
+        candidate_pool = [item for item in current_beam if item['score'] == current_beam[0]['score']]
+        if len(candidate_pool) > limit_x:
+            current_beam = random.sample(candidate_pool, limit_x)
+        else:
+            current_beam = current_beam[:limit_x]
 
         t_root_end = time.time()
         try:
-            print(f"            Root processing time: {t_root_end - t_root_start:.3f}s; root candidates: {len(current_beam)}")
+            print(f"            Root processing time: {t_root_end - t_root_start:.3f}s; root candidates: {len(current_beam)}; max score: {current_beam[0]['score'] if current_beam else 'N/A'}")
         except Exception:
             pass
-        if not current_beam: return None, 0.0
 
         # Step 1 to N
         # join_tree[0] 是 root, 循环从 1 开始
@@ -772,22 +851,29 @@ class JoinSampler:
             if not wander_plan: break
 
             t_sample_start = time.time()
-            candidates, execute_time = self.engine.sample_beam_extensions(
-                current_beam,
-                wander_plan,
-                template_data['pid_map'],
-                template_data['global_map'],
-                k_samples=self.lookahead_samples,
-                workload_name=self.workload_name,
-                uncovered_mask_int=uncovered_mask_int
-            )
+            if self.use_cpp:
+                candidates, execute_time = self.engine.sample_beam_extensions_cpp(
+                    current_beam,
+                    wander_plan,
+                    template_data['pid_map'],
+                    template_data['global_map'],
+                    k_samples=self.lookahead_samples,
+                    workload_name=self.workload_name,
+                    uncovered_mask_int=uncovered_mask_int
+                )
+            else:
+                candidates, execute_time = self.engine.sample_beam_extensions(
+                    current_beam,
+                    wander_plan,
+                    template_data['pid_map'],
+                    template_data['global_map'],
+                    k_samples=self.lookahead_samples,
+                    workload_name=self.workload_name,
+                    uncovered_mask_int=uncovered_mask_int
+                )
+
             t_sample_end = time.time()
             execute_time_total += execute_time
-            try:
-                cand_count = len(candidates) if candidates else 0
-                print(f"            Step {step_idx+1} ({next_alias}) sample_beam_extensions time: {t_sample_end - t_sample_start:.3f}s; candidates: {cand_count}")
-            except Exception:
-                pass
 
             if not candidates: return None, 0.0
 
@@ -824,6 +910,12 @@ class JoinSampler:
                     'bmp': bmp, 
                     'score': score
                 })
+
+            try:
+                cand_count = len(current_beam) if current_beam else 0
+                print(f"            Step {step_idx+1} ({next_alias}) sample_beam_extensions time: {t_sample_end - t_sample_start:.3f}s; candidates: {cand_count}; max score: {current_beam[0]['score'] if current_beam else 'N/A'}")
+            except Exception:
+                pass
 
         best_tuple = current_beam[0]
         full_row_ids = {}
@@ -868,9 +960,6 @@ class JoinSampler:
                 break
             
             for p_idx, partition_ids in enumerate(partitions):
-                if p_idx > 2:
-                    break
-                
                 partition_select_time_start = time.time()
                 best_tuple_info, execute_time = self.greedy_join_selection(
                     partition_ids, 
@@ -899,12 +988,40 @@ class JoinSampler:
             coverage_pct = (len(global_covered_queries) / total_queries * 100) if total_queries > 0 else 0
             print(f"        Bitmap {k+1} constructed. Size: {len(current_bitmap)}. Global Coverage: {coverage_pct:.2f}%. Total Time: {time.time() - bitmap_start_time:.2f}s")
 
-            if coverage_pct > 95.0:
-                print("        Coverage threshold reached (>95%). Ending bitmap construction early.")
+            if coverage_pct > 99.0:
+                print("        Coverage threshold reached (>99%). Ending bitmap construction early.")
                 break
             if coverage_pct < 1.0:
                 print("        Coverage too low (<1%). Continuing to next bitmap. May recheck strategy for this template.")
                 break
+
+            # # debug: 打印出没有覆盖的查询是哪些
+            # uncovered_qids = set(range(total_queries)) - global_covered_queries
+            # if uncovered_qids:
+            #     print(f"        [DEBUG] {len(uncovered_qids)} queries remaining uncovered.")
+            #     for debug_qidx in uncovered_qids:
+            #         # 1. 提取原始 SQL
+            #         raw_sql = template_data['raw_queries'][debug_qidx]
+
+            #         # 2. 拼接解析后的 SQL 骨架
+            #         reconstructed_parts = []
+            #         for u, v, edge_data in template_data['join_graph'].edges(data=True):
+            #             if "join_condition" in edge_data:
+            #                 reconstructed_parts.append(edge_data["join_condition"])
+            #         for alias in template_data['aliases']:
+            #             pid = template_data['table_pids'][alias].get(debug_qidx, -1)
+            #             if pid != -1:
+            #                 real_name = template_data['real_names'][alias]
+            #                 pred_str = self.global_pid_to_pred[real_name].get(pid, "")
+            #                 if pred_str:
+            #                     # 给谓词打上别名标签，方便阅读
+            #                     reconstructed_parts.append(f"[{alias} filter] {pred_str}")
+                                
+            #         recon_sql = " AND ".join(reconstructed_parts)
+                    
+            #         print(f"          > QID {debug_qidx}:")
+            #         print(f"            - Original   : {raw_sql}")
+            #         print(f"            - Reconstruct: {recon_sql}")
         
         return generated_samples
 
@@ -939,97 +1056,100 @@ class JoinSampler:
         start_time = time.time()
         self.load_and_parse_workload() 
         print(f"Total Join Templates Loaded: {len(self.join_templates)}, Workload Parsing Time: {time.time() - start_time:.2f}s")
-        # self.create_annotation_tables()
-        # if not self.join_templates:
-        #     print("No join templates found. Exiting.")
-        #     return
+        self.create_annotation_tables()
+        if not self.join_templates:
+            print("No join templates found. Exiting.")
+            return
         
-        # cur_output_path = os.path.join(self.output_path, str(worker_id))
+        cur_output_path = os.path.join(self.output_path, str(worker_id))
 
-        # if not os.path.exists(cur_output_path):
-        #     os.makedirs(cur_output_path)
-        #     print(f"Created output directory: {cur_output_path}")
+        if not os.path.exists(cur_output_path):
+            os.makedirs(cur_output_path)
+            print(f"Created output directory: {cur_output_path}")
 
-        # # 在开始采样前，加载已有的 samples_batch_*.json，记录已生成的 template_id，用于跳过
-        # existing_templates = self.load_existing_template_ids(cur_output_path)
+        # 在开始采样前，加载已有的 samples_batch_*.json，记录已生成的 template_id，用于跳过
+        existing_templates = self.load_existing_template_ids(cur_output_path)
 
-        # SAVE_BATCH_SIZE = 10
-        # current_batch_samples = {}
-        # processed_count = 0
-        # batch_index = 0
+        SAVE_BATCH_SIZE = 10
+        current_batch_samples = {}
+        processed_count = 0
+        batch_index = 0
 
-        # all_items = list(self.join_templates.items())
-        # my_tasks = []
-        # skipped = 0
-        # # 构建分配给当前 worker 的任务列表，跳过已经存在的 template，并将已存在的计入 processed_count
-        # for i, item in enumerate(all_items):
-        #     if i % num_workers == worker_id:
-        #         template_id = item[0]
-        #         if template_id in existing_templates:
-        #             skipped += 1
-        #             processed_count += 1
-        #             continue
-        #         my_tasks.append(item)
+        all_items = list(self.join_templates.items())
+        my_tasks = []
+        skipped = 0
+        # 构建分配给当前 worker 的任务列表，跳过已经存在的 template，并将已存在的计入 processed_count
+        for i, item in enumerate(all_items):
+            if i % num_workers == worker_id:
+                template_id = item[0]
+                if template_id in existing_templates:
+                    skipped += 1
+                    processed_count += 1
+                    continue
+                my_tasks.append(item)
 
-        # # 初始化 batch_index 使之与已存在的 processed_count 对齐，避免覆盖已有批次文件
-        # batch_index = processed_count // SAVE_BATCH_SIZE
-        # if skipped:
-        #     print(f"Worker {worker_id}: Skipped {skipped} templates already generated. Initialized processed_count={processed_count}, batch_index={batch_index}.")
-        # print(f"Worker {worker_id}: Assigned {len(my_tasks)}/{len(all_items)} templates.")
+        # 初始化 batch_index 使之与已存在的 processed_count 对齐，避免覆盖已有批次文件
+        batch_index = processed_count // SAVE_BATCH_SIZE
+        if skipped:
+            print(f"Worker {worker_id}: Skipped {skipped} templates already generated. Initialized processed_count={processed_count}, batch_index={batch_index}.")
+        print(f"Worker {worker_id}: Assigned {len(my_tasks)}/{len(all_items)} templates.")
 
-        # for template_id, template_data in my_tasks:
-        #     if len(template_data['aliases']) < 2:
-        #         # print(f"\n=== Skipping Template: {template_id} (only {len(template_data['aliases'])} table) ===")
-        #         continue
+        for template_id, template_data in my_tasks:
+            if len(template_data['aliases']) < 2:
+                # print(f"\n=== Skipping Template: {template_id} (only {len(template_data['aliases'])} table) ===")
+                continue
 
-        #     print(f"\n=== Processing Template: {template_id} ===")
-        #     print(f"    Tables: {template_data['aliases']}")
-        #     print(f"    Total Queries in Group: {template_data['queries_count']}")
+            if template_id != "st_b_st_c_st_p_st_ph_st_pl_st_t_st_u_st_v_e3e5f6":
+                continue
 
-        #     self.add_sel_info_to_graph(template_data)
+            print(f"\n=== Processing Template: {template_id} ===")
+            print(f"    Tables: {template_data['aliases']}")
+            print(f"    Total Queries in Group: {template_data['queries_count']}")
 
-        #     join_graph = template_data['join_graph']
-        #     aliases = template_data['aliases']
+            self.add_sel_info_to_graph(template_data)
 
-        #     try:
-        #         join_order_tree, root_table = self.build_join_tree_structure(join_graph, aliases)
-        #         print(f"    Join Root: {root_table}")
-        #         partitions = self.partition_root_table(root_table=root_table, 
-        #                                                 m_partitions=self.m_partitions, 
-        #                                                 template_data=template_data)
-        #         print(f"    Root table partitioned into {len(partitions)} segments.")
-        #         time_sampling_start = time.time()
+            join_graph = template_data['join_graph']
+            aliases = template_data['aliases']
 
-        #         template_samples = self.sample_for_one_template(
-        #                 partitions=partitions,
-        #                 root_table=root_table,
-        #                 join_order_tree=join_order_tree,
-        #                 template_data=template_data
-        #             )
+            try:
+                join_order_tree, root_table = self.build_join_tree_structure(join_graph, aliases)
+                print(f"    Join Root: {root_table}")
+                partitions = self.partition_root_table(root_table=root_table, 
+                                                        m_partitions=self.m_partitions, 
+                                                        template_data=template_data)
+                print(f"    Root table partitioned into {len(partitions)} segments.")
+                time_sampling_start = time.time()
+
+                template_samples = self.sample_for_one_template(
+                        partitions=partitions,
+                        root_table=root_table,
+                        join_order_tree=join_order_tree,
+                        template_data=template_data
+                    )
                 
-        #         current_batch_samples[template_id] = template_samples
-        #         processed_count += 1
-        #         print(f"    Sampling completed in {time.time() - time_sampling_start:.2f}s.")
+                current_batch_samples[template_id] = template_samples
+                processed_count += 1
+                print(f"    Sampling completed in {time.time() - time_sampling_start:.2f}s.")
 
-        #         if processed_count % SAVE_BATCH_SIZE == 0:
-        #             batch_filename = f"samples_batch_{batch_index}.json"
-        #             batch_full_path = os.path.join(cur_output_path, batch_filename)
-        #             self.save_samples(current_batch_samples, batch_full_path)
-        #             print(f"    >>> Saved batch {batch_index} (Templates {processed_count - SAVE_BATCH_SIZE + 1} to {processed_count}), Used Time: {time.time() - start_time:.2f}s")
-        #             batch_index += 1
-        #             current_batch_samples = {}
+                if processed_count % SAVE_BATCH_SIZE == 0:
+                    batch_filename = f"samples_batch_{batch_index}.json"
+                    batch_full_path = os.path.join(cur_output_path, batch_filename)
+                    self.save_samples(current_batch_samples, batch_full_path)
+                    print(f"    >>> Saved batch {batch_index} (Templates {processed_count - SAVE_BATCH_SIZE + 1} to {processed_count}), Used Time: {time.time() - start_time:.2f}s")
+                    batch_index += 1
+                    current_batch_samples = {}
 
-        #     except Exception as e:
-        #         print(f"ERROR processing template {template_id}: {e}")
-        #         import traceback
-        #         traceback.print_exc()
+            except Exception as e:
+                print(f"ERROR processing template {template_id}: {e}")
+                import traceback
+                traceback.print_exc()
         
-        # if current_batch_samples:
-        #     batch_filename = f"samples_batch_{batch_index}.json"
-        #     batch_full_path = os.path.join(cur_output_path, batch_filename)
-        #     self.save_samples(current_batch_samples, batch_full_path)
-        #     print(f"    >>> Saved final batch {batch_index} (Templates {processed_count - len(current_batch_samples) + 1} to {processed_count})...")
-        # print(f"\nAll tasks finished. Results saved to directory: {self.output_path}. Total Time: {time.time() - start_time:.2f}s")
+        if current_batch_samples:
+            batch_filename = f"samples_batch_{batch_index}.json"
+            batch_full_path = os.path.join(cur_output_path, batch_filename)
+            self.save_samples(current_batch_samples, batch_full_path)
+            print(f"    >>> Saved final batch {batch_index} (Templates {processed_count - len(current_batch_samples) + 1} to {processed_count})...")
+        print(f"\nAll tasks finished. Results saved to directory: {self.output_path}. Total Time: {time.time() - start_time:.2f}s")
 
     def save_samples(self, samples_dict, output_path):
         formatted_output = {}
@@ -1065,14 +1185,25 @@ class JoinSampler:
             raise e
         
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    if len(sys.argv) != 4:
         print("Usage: python join_sampler.py <config_path>")
         sys.exit(1)
     
     config_path = sys.argv[1]
+    worker_id = int(sys.argv[2])
+    num_workers = int(sys.argv[3])
 
     sampler = JoinSampler(config_path)
     try:
-        sampler.sample()
+        sampler.sample(worker_id=worker_id, num_workers=num_workers)
     finally:
         sampler.close()
+
+
+# query former
+# root表不分区试一下，固定sample数量，root表还是每个tuple都往后做wander join
+# 样本选择模型可以直接在单表的上面拼接
+# 后续需要变化sample的大小，变化不同查询覆盖率的样本
+# workload shift
+
+# 看一下磁盘 内存 CPU 的占用情况 发给老师租个服务器

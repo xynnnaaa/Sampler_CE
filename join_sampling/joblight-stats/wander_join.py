@@ -7,6 +7,7 @@ import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import numpy as np
+import cpp_wander_join
 
 class WanderJoinEngine:
     def __init__(self, db_config):
@@ -84,21 +85,24 @@ class WanderJoinEngine:
         db_cols = []
         result_keys = []
 
+        # 构造 SQL
+        vals_str = ",".join([f"'{v}'" for v in unique_vals])
+
+        filter_sql = f"t.{my_join_col} IN ({vals_str})"
+
         for sel in sels:
             col_pure = sel.split('.')[-1]
             db_cols.append(f"t.{col_pure}")
             # result_key的格式是"alias.col"
             result_keys.append(sel)
+            filter_sql += f" AND t.{col_pure} IS NOT NULL"
 
         cols_sql = ", ".join(db_cols) if db_cols else "t.id"
-        
-        # 构造 SQL
-        vals_str = ",".join([f"'{v}'" for v in unique_vals])
         
         sql = f"""
             SELECT {cols_sql}
             FROM {table_real_name} t
-            WHERE t.{my_join_col} IN ({vals_str})
+            WHERE {filter_sql}
         """
 
         # 使用temp_partition_filter表来避免SQL长度过长问题
@@ -140,7 +144,7 @@ class WanderJoinEngine:
 
             row_data = {}
             for i, key in enumerate(result_keys):
-                row_data[key] = str(r[i])
+                row_data[key] = str(r[i]) if r[i] is not None else None
                 
             neighbors[p_val].append(row_data)
             
@@ -281,7 +285,7 @@ class WanderJoinEngine:
             for path in active_paths:
                 if path['alive']:
                     val = path['vals'].get(parent_key)
-                    if val:
+                    if val is not None and val != 'None':
                         batch_vals.append(val)
                     else:
                         path['alive'] = False
@@ -408,6 +412,9 @@ class WanderJoinEngine:
                 'score': res['score']
             })
 
+        # 添加扰动：同分数的候选打乱顺序，避免每次都选同一条路径
+        random.shuffle(proposed_candidates)
+
         print(f"                _batch_fetch_neighbors called {batch_fetch_calls} times, total time: {total_batch_fetch_time:.4f}s")
         print(f"                _translate_pid_bitmap called {translate_calls} times, total time: {total_translate_time:.4f}s")
         # # 新增详细计时输出
@@ -416,229 +423,34 @@ class WanderJoinEngine:
         # print(f"                selection total time: {total_selection_time:.6f}s, candidates chosen: {total_candidates_chosen}")
         # print(f"                update paths total time: {total_update_paths_time:.6f}s, updates applied: {total_update_count}")
         # print(f"                aggregation time: {total_aggregation_time:.6f}s")
-        # print(f"                wander join success count: {wander_success_count}, success rate: {wander_success_count/len(active_paths) if active_paths else 0:.4f}")
+        print(f"                wander join success count: {wander_success_count}, success rate: {wander_success_count/len(active_paths) if active_paths else 0:.4f}")
 
         return proposed_candidates, execute_query_time
 
 
-    # def sample_beam_extensions(self, current_beam, lookahead_plan, pid_map_full, global_map_full, k_samples=1, workload_name="", uncovered_mask_int=0):
-    #     """
-    #     [核心 - Optimized Vectorized Version] 
-    #     针对 Object 类型大整数优化的 Pandas 版本。
-    #     采用“资源池+索引”策略，彻底消除循环内的 DataFrame 构建开销。
-    #     """
-    #     # 类型安全检查
-    #     try:
-    #         uncovered_mask_int = int(uncovered_mask_int)
-    #     except:
-    #         pass
+    def sample_beam_extensions_cpp(self, current_beam, lookahead_plan, pid_map_full, global_map_full, k_samples=1, workload_name="", uncovered_mask_int=0):
+        """
+        [核心] 使用 C++ 优化的版本对 Beam 中的元组进行随机扩展采样。
+        """
+        self.connect()
 
-    #     self.connect()
-    #     execute_query_time = 0.0
+        if not current_beam or not lookahead_plan:
+            return [], 0.0
 
-    #     # 计时统计 - 初始化累计变量
-    #     total_batch_fetch_time = 0.0
-    #     batch_fetch_calls = 0
+        # 调用 C++ 模块处理极其耗时的循环和路径构建
+        proposed_candidates, execute_query_time = cpp_wander_join.cpp_sample_beam_extensions(
+            self,                  # 将当前实例传入，C++ 通过它回调 _batch_fetch_* 系列函数
+            current_beam, 
+            lookahead_plan, 
+            pid_map_full, 
+            global_map_full, 
+            k_samples, 
+            workload_name, 
+            uncovered_mask_int
+        )
 
-    #     total_translate_time = 0.0
-    #     translate_calls = 0
+        # 添加扰动：同分数的候选打乱顺序，避免每次都选同一条路径
+        # 由于在 C++ 端操作 py::list 随机打乱比较繁琐，回到 Python 端只需一行代码，性能极快
+        random.shuffle(proposed_candidates)
 
-    #     if not current_beam or not lookahead_plan:
-    #         return [], execute_query_time
-
-    #     # ---------------------------------------------------------
-    #     # 1. 初始化：current_beam -> DataFrame
-    #     # ---------------------------------------------------------
-    #     beam_records = []
-    #     for t_idx, item in enumerate(current_beam):
-    #         rec = {'t_idx': t_idx, 'acc_bmp': item['bmp']}
-    #         rec.update(item['data'])
-    #         beam_records.append(rec)
-
-    #     df = pd.DataFrame(beam_records)
-    #     # 强制使用 object 类型以支持大整数
-    #     df['acc_bmp'] = df['acc_bmp'].astype(object) 
-        
-    #     # 爆炸扩张
-    #     df = df.loc[df.index.repeat(k_samples)].reset_index(drop=True)
-
-    #     # 用于最后保存 Rj 数据
-    #     # 我们只保存 rj 的 id，最后再回查，避免中间拖着大字典跑
-    #     rj_data_pool = {} 
-
-    #     # ---------------------------------------------------------
-    #     # 2. 逐层 Lookahead
-    #     # ---------------------------------------------------------
-    #     for step_idx, step in enumerate(lookahead_plan):
-    #         alias = step['alias']
-    #         real_name = step['real_name']
-    #         parent_alias = step['parent']
-    #         raw_cond = step['join_condition']
-    #         sel_cols = step.get('sels', [])
-
-    #         my_col, parent_col = self._parse_cond(raw_cond, alias, parent_alias)
-    #         if not my_col: continue
-
-    #         parent_key = f"{parent_alias}.{parent_col}"
-
-    #         if parent_key not in df.columns:
-    #             df = pd.DataFrame()
-    #             break
-            
-    #         # 过滤无效行
-    #         valid_mask = df[parent_key].notnull()
-    #         df = df[valid_mask]
-    #         if df.empty: break
-
-    #         # 查数据库
-    #         unique_vals = df[parent_key].unique().tolist()
-    #         unique_vals = [str(v) for v in unique_vals]
-
-    #         t_bf0 = time.time()
-    #         neighbors, ex_time = self._batch_fetch_neighbors(real_name, my_col, unique_vals, sel_cols, alias)
-    #         t_bf1 = time.time()
-    #         batch_fetch_calls += 1
-    #         total_batch_fetch_time += (t_bf1 - t_bf0)
-    #         execute_query_time += ex_time
-
-    #         if not neighbors:
-    #             df = pd.DataFrame()
-    #             break
-            
-    #         # =========================================================
-    #         # [核心修正点]：资源池化 (Flattening)
-    #         # 这里的 neighbors 是 {p_val: [dict, dict...]}
-    #         # 我们先把它转换成一个扁平的 DataFrame (Pool)，方便后续直接 iloc 抓取
-    #         # =========================================================
-            
-    #         # 1. 将 neighbors 拍平为 (parent_val, neighbor_dict) 的列表
-    #         #    这一步比在 Pandas 里做 map 要快，因为只需遍历 unique_vals
-    #         flat_rows = []
-    #         flat_indices = [] # 记录每一行对应的 parent_val
-            
-    #         # 预计算 pool 的行号范围： parent_val -> [start_idx, end_idx)
-    #         # 或者 parent_val -> [idx1, idx2, idx3...]
-    #         pval_to_indices = {}
-    #         current_idx = 0
-            
-    #         # 这一步循环次数 = unique_vals 的数量 (几百到几千)，非常快
-    #         # 而不是 25万次
-    #         pool_data_list = []
-            
-    #         for p_val, candidates in neighbors.items():
-    #             if not candidates: continue
-    #             count = len(candidates)
-    #             # 记录索引范围
-    #             pval_to_indices[p_val] = np.arange(current_idx, current_idx + count)
-    #             current_idx += count
-    #             pool_data_list.extend(candidates)
-            
-    #         if not pool_data_list:
-    #             df = pd.DataFrame()
-    #             break
-
-    #         # 创建资源池 DataFrame (只建一次！)
-    #         pool_df = pd.DataFrame(pool_data_list)
-            
-    #         # 2. 映射索引：给主 df 的每一行找到对应的候选索引数组
-    #         # map 操作：parent_val -> [idx, idx, idx...]
-    #         # 注意：p_val 来自数据库可能是 int 或 str，需确保类型一致
-    #         # df[parent_key] 也是 object(str)
-    #         cand_indices_series = df[parent_key].astype(str).map(pval_to_indices)
-            
-    #         # 过滤掉没找到邻居的行
-    #         valid_paths = cand_indices_series.notnull()
-    #         df = df[valid_paths]
-    #         cand_indices_series = cand_indices_series[valid_paths]
-            
-    #         if df.empty: break
-            
-    #         # 3. 向量化随机选择索引
-    #         # 获取每个候选列表的长度
-    #         lengths = cand_indices_series.apply(len).values
-    #         # 生成随机偏移量
-    #         offsets = np.random.randint(0, lengths)
-            
-    #         # 计算最终选中的 Pool 行号
-    #         # 我们需要从 cand_indices_series (Series of arrays) 中提取第 offsets 个元素
-    #         # 利用 numpy 的高级索引技巧或简单的列表推导 (这里列表推导够快，因为只涉及整数)
-    #         final_pool_indices = [arr[off] for arr, off in zip(cand_indices_series, offsets)]
-            
-    #         # 4. 从资源池中提取数据 (极快！因为全是底层内存拷贝)
-    #         # iloc 提取后 reset_index 对齐到 df 的 index
-    #         chosen_df = pool_df.iloc[final_pool_indices].set_index(df.index)
-            
-    #         # 5. 合并数据 (直接列赋值)
-    #         # 此时不再有 pd.DataFrame(list_of_dicts) 的巨大开销
-    #         for col in chosen_df.columns:
-    #             df[col] = chosen_df[col]
-
-    #         # =========================================================
-    #         # [位运算部分]：保持 object 类型的正确处理
-    #         # =========================================================
-    #         id_col = f"{alias}.id" if f"{alias}.id" in chosen_df.columns else f"{alias}.Id"
-            
-    #         if id_col in chosen_df.columns:
-    #             chosen_ids = chosen_df[id_col].dropna().unique().tolist()
-    #             my_pid_map = pid_map_full.get(alias, {})
-    #             my_global_mask = global_map_full.get(alias, 0)
-
-    #             t_tr0 = time.time()
-    #             translated_map, ex_time = self._batch_fetch_translate_bitmaps(
-    #                 real_name, chosen_ids, workload_name, alias, my_pid_map, my_global_mask
-    #             )
-    #             t_tr1 = time.time()
-    #             translate_calls += 1
-    #             total_translate_time += (t_tr1 - t_tr0)
-    #             execute_query_time += ex_time
-
-    #             # 映射 Bitmap (Object)
-    #             qid_masks = df[id_col].astype(str).map(translated_map).fillna(my_global_mask).astype(object)
-                
-    #             # 执行位运算 (Object)
-    #             df['acc_bmp'] = np.bitwise_and(df['acc_bmp'].values, qid_masks.values)
-
-    #             if step_idx == 0:
-    #                 df['rj_id'] = df[id_col]
-    #                 df['rj_bmp'] = qid_masks.values
-    #                 # 缓存 Rj 数据，供最后使用
-    #                 # 这里的 chosen_df 已经包含了所有数据
-    #                 # 我们只需要保存 unique 的 rj 数据
-    #                 unique_rj_df = chosen_df.drop_duplicates(subset=[id_col])
-    #                 for _, row in unique_rj_df.iterrows():
-    #                     rj_data_pool[row[id_col]] = row.to_dict()
-    #         else:
-    #             if step_idx == 0:
-    #                 df['rj_id'] = None
-    #                 df['rj_bmp'] = 0
-
-    #     # ---------------------------------------------------------
-    #     # 3. 聚合打分 (利用 apply 优化)
-    #     # ---------------------------------------------------------
-    #     proposed_candidates = []
-    #     if not df.empty and 'rj_id' in df.columns:
-    #         df = df[df['rj_id'].notnull()]
-    #         if not df.empty:
-    #             # 针对大整数的 bit_count
-    #             # Python 3.10+ int.bit_count() 极快
-    #             if hasattr(int(0), 'bit_count'):
-    #                 df['score'] = df['acc_bmp'].apply(lambda x: (int(x) & uncovered_mask_int).bit_count())
-    #             else:
-    #                 df['score'] = df['acc_bmp'].apply(lambda x: bin(int(x) & uncovered_mask_int).count('1'))
-                
-    #             # 找到每组 (t_idx, rj_id) 分数最高的行
-    #             idx_max = df.groupby(['t_idx', 'rj_id'])['score'].idxmax()
-    #             best_df = df.loc[idx_max]
-
-    #             for _, row in best_df.iterrows():
-    #                 rj_id_val = row['rj_id']
-    #                 proposed_candidates.append({
-    #                     't_idx': int(row['t_idx']),
-    #                     'rj_data': rj_data_pool.get(rj_id_val, {}),
-    #                     'rj_bmp': int(row['rj_bmp']),
-    #                     'score': int(row['score'])
-    #                 })
-
-    #     print(f"                _batch_fetch_neighbors called {batch_fetch_calls} times, total time: {total_batch_fetch_time:.4f}s")
-    #     print(f"                _translate_pid_bitmap called {translate_calls} times, total time: {total_translate_time:.4f}s")
-    #     return proposed_candidates, execute_query_time
+        return proposed_candidates, execute_query_time
