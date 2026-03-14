@@ -10,31 +10,21 @@ import numpy as np
 import cpp_wander_join
 
 class WanderJoinEngine:
-    def __init__(self, db_config):
-        self.db_config = db_config
-        self.conn = None
-        self.cursor = None
-        self.connect()
-
+    def __init__(self, conn, cursor):
+        self.conn = conn
+        self.cursor = cursor
         self.bitmap_cache = {}
 
     def connect(self):
-        if not self.conn:
-            self.conn = psycopg2.connect(**self.db_config)
-            self.cursor = self.conn.cursor()
-            # self.cursor.execute("""
-            #     CREATE TEMP TABLE IF NOT EXISTS temp_partition_filter (
-            #         pid bigint
-            #     ) ON COMMIT PRESERVE ROWS;
-            # """)
-            # self.cursor.execute("""
-            #     CREATE INDEX IF NOT EXISTS temp_partition_filter_pid_idx
-            #     ON temp_partition_filter(pid);
-            # """)
+        # if not self.conn:
+        #     self.conn = psycopg2.connect(**self.db_config)
+        #     self.cursor = self.conn.cursor()
+        pass 
 
     def close(self):
-        if self.cursor: self.cursor.close()
-        if self.conn: self.conn.close()
+        # if self.cursor: self.cursor.close()
+        # if self.conn: self.conn.close()
+        pass
 
     def _parse_cond(self, cond_str, my_alias, parent_alias):
         """解析连接条件，返回 (my_col, parent_col)"""

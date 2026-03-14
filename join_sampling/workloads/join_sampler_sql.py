@@ -176,6 +176,15 @@ TABLE_CARD_ERGASTF1 = {
     "seasons": 68,
 }
 
+TABLE_CARD_GENOME = {
+    "img_obj": 1750617,
+    "img_obj_att": 1074676,
+    "img_rel": 763159,
+    "att_classes": 699,
+    "obj_classes": 300,
+    "pred_classes": 150,
+}
+
 class JoinSampler:
     def __init__(self, config_path: str):
         print(f"Initializing JoinSampler with config: {config_path}")
@@ -247,7 +256,7 @@ class JoinSampler:
             raise e
         
         # [Added] Initialize Engine
-        self.engine = WanderJoinEngine(self.db_config)
+        self.engine = WanderJoinEngine(self.conn, self.cursor)
 
         import itertools
         self.tie_breaker = itertools.count()
@@ -477,12 +486,12 @@ class JoinSampler:
                 "raw_queries": raw_queries_list,  # debug 用
             }
 
-        for join_key in all_join_keys:
-            jc_parts = join_key.split(".")
-            jc_col = jc_parts[1]
-            real_name = jc_parts[0]
-            index_name = f"idx_{jc_col}_{real_name}"
-            print(f"CREATE INDEX IF NOT EXISTS {index_name} ON {real_name} ({jc_col});")
+        # for join_key in all_join_keys:
+        #     jc_parts = join_key.split(".")
+        #     jc_col = jc_parts[1]
+        #     real_name = jc_parts[0]
+        #     index_name = f"idx_{jc_col}_{real_name}"
+        #     print(f"CREATE INDEX IF NOT EXISTS {index_name} ON {real_name} ({jc_col});")
 
         # 将join_templates按照alias个数升序排列
         # self.join_templates = dict(sorted(self.join_templates.items(), key=lambda item: len(item[1]['aliases'])))
@@ -590,6 +599,8 @@ class JoinSampler:
                 card = TABLE_CARD_STATS.get(real_name.lower(), float("inf"))
             elif "ergastf1" in self.db_config.get("dbname", "").lower():
                 card = TABLE_CARD_ERGASTF1.get(real_name.lower(), float("inf"))
+            elif "genome" in self.db_config.get("dbname", "").lower():
+                card = TABLE_CARD_GENOME.get(real_name.lower(), float("inf"))
             else:
                 print(f"Warning: Unknown database '{self.db_config.get('dbname', '')}', defaulting cardinality to infinity.")
                 card = float("inf")
@@ -632,6 +643,8 @@ class JoinSampler:
                             card = TABLE_CARD_STATS.get(real_name.lower(), float("inf"))
                         elif "ergastf1" in self.db_config.get("dbname", "").lower():
                             card = TABLE_CARD_ERGASTF1.get(real_name.lower(), float("inf"))
+                        elif "genome" in self.db_config.get("dbname", "").lower():
+                            card = TABLE_CARD_GENOME.get(real_name.lower(), float("inf"))
                         else:
                             print(f"Warning: Unknown database '{self.db_config.get('dbname', '')}', defaulting cardinality to infinity.")
                             card = float("inf")
@@ -802,6 +815,8 @@ class JoinSampler:
                         print(f"            Processed row batch {row_batch_count}/{total_row_batches} (IDs [{current_id}, {next_id})). Time: {time.time() - t0:.2f}s")
 
                     current_id = next_id
+
+                self.conn.commit()
 
                 old_isolation_level = self.conn.isolation_level
                 self.conn.set_isolation_level(0)  # 设置为 autocommit 模式
@@ -1088,6 +1103,7 @@ class JoinSampler:
             #         print(f"            - Original   : {raw_sql}")
             #         print(f"            - Reconstruct: {recon_sql}")
         
+        self.conn.commit()
         return generated_samples
 
     def load_existing_template_ids(self, cur_output_path):
@@ -1203,6 +1219,9 @@ class JoinSampler:
 
             except Exception as e:
                 print(f"ERROR processing template {template_id}: {e}")
+                
+                self.conn.rollback()
+
                 import traceback
                 traceback.print_exc()
         
