@@ -300,28 +300,28 @@ class JoinSampler:
         temp_groups = defaultdict(list)
         temp_graphs = {}
 
+        try:
+            with open(self.sql_file, 'r') as f:
+                lines = f.readlines()
+        except Exception as e:
+            print(f"Error loading {self.sql_file}: {e}")
+            return
+
         # try:
-        #     with open(self.sql_file, 'r') as f:
-        #         lines = f.readlines()
+        #     with open("/data2/xuyining/PRICE/datas/workloads/test/ergastf1/workloads.sql", 'r') as f:
+        #         lines_1 = f.readlines()
         # except Exception as e:
         #     print(f"Error loading {self.sql_file}: {e}")
         #     return
-
-        try:
-            with open("/data2/xuyining/PRICE/datas/workloads/test/ergastf1/workloads.sql", 'r') as f:
-                lines_1 = f.readlines()
-        except Exception as e:
-            print(f"Error loading {self.sql_file}: {e}")
-            return
         
-        try:
-            with open("/data2/xuyining/PRICE/datas/workloads/finetune/ergastf1/workloads.sql", 'r') as f:
-                lines_2 = f.readlines()
-        except Exception as e:
-            print(f"Error loading {self.sql_file}: {e}")
-            return
+        # try:
+        #     with open("/data2/xuyining/PRICE/datas/workloads/finetune/ergastf1/workloads.sql", 'r') as f:
+        #         lines_2 = f.readlines()
+        # except Exception as e:
+        #     print(f"Error loading {self.sql_file}: {e}")
+        #     return
         
-        lines = lines_1 + lines_2
+        # lines = lines_1 + lines_2
         
         for line_idx, line in enumerate(lines):
             line = line.strip()
@@ -444,11 +444,6 @@ class JoinSampler:
         for real_table, pred_map in self.global_predicate_map.items():
             print(f"  Table '{real_table}': {len(pred_map)} unique predicates.")
 
-            if real_table == "drivers":
-                print("    Sample predicates in  drivers:")
-                for pred, pid in list(pred_map.items())[:100]:
-                    print(f"      PID {pid}: {pred}")
-
          # 构建最终的 join_templates 结构
         for template_key, query_list in temp_groups.items():
             # print(f"Template {template_key} with {len(query_list)} queries...")
@@ -564,8 +559,8 @@ class JoinSampler:
             join_graph.nodes()[node]["sels"] = sels
 
             # 检查连接列是否有索引，如果没有就加上索引
-            if self.db_config.get("dbname", "").lower() == "ergastf1" or self.db_config.get("dbname", "").lower() == "genome":
-                real_name = info["real_name"]
+            # if self.db_config.get("dbname", "").lower() == "ergastf1" or self.db_config.get("dbname", "").lower() == "genome":
+            #     real_name = info["real_name"]
                 # for jc in sels:
                 #     jc_col = jc.split(".")[1]
                 #     if jc_col.lower() == "id":
@@ -617,7 +612,7 @@ class JoinSampler:
 
         # 2.6 这里新加了特殊处理
         if "imdb" in self.db_config.get("dbname", "").lower():
-            if root_table is None or root_table == 'imdb_ci' or root_table == 'imdb_mi' or root_table == 'imdb_mi' or root_table == 'imdb_pi':
+            if root_table is None or root_table == 'imdb_ci' or root_table == 'imdb_mi' or root_table == 'imdb_pi':
                 root_table = scored[0][1]
 
         visited = {root_table}

@@ -1,4 +1,5 @@
 import json
+import time
 import psycopg2
 import os
 import sys
@@ -9,6 +10,73 @@ from collections import defaultdict
 import random
 import glob
 import pickle
+import datetime
+
+import re
+
+def timestamp_to_string(timestamp_str):
+    # 将时间戳字符串转换为整数
+    unix_timestamp = int(timestamp_str)
+    
+    # 将 Unix 时间戳转换为 datetime 对象
+    dt = datetime.datetime.fromtimestamp(unix_timestamp)
+    
+    # 将 datetime 对象格式化为时间字符串
+    timestamp_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+    
+    return timestamp_str
+
+def convert_timestamps_in_sql(sql):
+    # 使用正则表达式匹配形如 column op value 的谓词，其中 column 以 date 或 Date 结尾，value 是数字
+    pattern = r'(\w+)\s*([<>=!]+)\s*(\d+)'
+    def replace_match(match):
+        full_col = match.group(1)
+        col_name = match.group(1)
+        op = match.group(2)
+        value = match.group(3)
+        if col_name.endswith('date') or col_name.endswith('Date'):
+            converted_value = timestamp_to_string(value)
+            return f"{full_col} {op} '{converted_value}'::timestamp"
+        else:
+            return match.group(0)
+    return re.sub(pattern, replace_match, sql)
+
+def remove_unnecessary_parentheses(sql_str):
+    """
+    预处理 SQL，专门剥离 WHERE 条件中每个谓词最外层的括号，并删去末尾分号
+    例如：将 WHERE (A = B) AND ((C = D)) 转换为 WHERE A = B AND C = D
+    注意：不会影响 SELECT COUNT(*) 中的括号，也不会影响 IN (1, 2) 的括号。
+    """
+    # 1. 找到 WHERE 的位置 (忽略大小写)
+    match = re.search(r'\bWHERE\b', sql_str, re.IGNORECASE)
+    if not match:
+        return sql_str  # 如果没有 WHERE 子句，直接返回
+    
+    where_idx = match.end()
+    select_from_part = sql_str[:where_idx] # "SELECT ... FROM ... WHERE"
+    where_part = sql_str[where_idx:]       # " (a=b) AND (c=d);"
+    
+    # 2. 提取并暂时移除末尾的分号（如果有）
+    where_part = where_part.strip()
+    has_semicolon = where_part.endswith(";")
+    if has_semicolon:
+        where_part = where_part[:-1].strip()
+        
+    # 3. 按 AND 切分所有的谓词条件 (忽略大小写)
+    conditions = re.split(r'\s+AND\s+', where_part, flags=re.IGNORECASE)
+    
+    # 4. 剥离每个条件最外层的括号
+    clean_conditions = []
+    for cond in conditions:
+        cond = cond.strip()
+        # 循环剥离，应对像 ((a.id = b.id)) 这种嵌套的多重括号
+        while cond.startswith("(") and cond.endswith(")"):
+            cond = cond[1:-1].strip()
+        clean_conditions.append(cond)
+        
+    # 5. 重新使用 AND 拼装起来
+    new_where = " AND ".join(clean_conditions)
+    return select_from_part + " " + new_where
 
 class Sampler:
     def __init__(self, config_path: str):
@@ -20,7 +88,6 @@ class Sampler:
         self.conn = psycopg2.connect(
             dbname=self.config["db"]["name"],
             user=self.config["db"]["user"],
-            password=self.config["db"]["password"],
             host=self.config["db"]["host"],
             port=self.config["db"]["port"],
         )
@@ -33,30 +100,55 @@ class Sampler:
         self.samples: Dict[str, List[List[Any]]] = defaultdict(list)
         self.query_counter = 0
 
-        try:
-            template_names = [d for d in os.listdir(self.base_query_dir) if os.path.isdir(os.path.join(self.base_query_dir, d))]
-        except FileNotFoundError:
-            print(f"ERROR: Base query directory not found: {self.base_query_dir}")
-            return
-        
-        if not template_names:
-            print(f"No template subdirectories found in '{self.base_query_dir}'.")
-            return
-        
         self.workload = []
-        for template_name in sorted(template_names):
-            input_template_dir = os.path.join(self.base_query_dir, template_name)
-            pkl_files = sorted(glob.glob(os.path.join(input_template_dir, "*.pkl")))
-            if not pkl_files:
-                print(f"No .pkl files found in '{input_template_dir}'. Skipping this template.")
-                continue
-            for pkl_file in pkl_files:
-                with open(pkl_file, "rb") as f:
-                    query_data = pickle.load(f)
-                    sql_query = query_data.get("sql")
-                    # query_name = os.path.basename(pkl_file)
-                    if sql_query:
-                        self.workload.append(sql_query)
+
+        if ".sql" not in self.base_query_dir:
+            try:
+                template_names = [d for d in os.listdir(self.base_query_dir) if os.path.isdir(os.path.join(self.base_query_dir, d))]
+            except FileNotFoundError:
+                print(f"ERROR: Base query directory not found: {self.base_query_dir}")
+                return
+            
+            if not template_names:
+                print(f"No template subdirectories found in '{self.base_query_dir}'.")
+                return
+            
+            for template_name in sorted(template_names):
+                input_template_dir = os.path.join(self.base_query_dir, template_name)
+                pkl_files = sorted(glob.glob(os.path.join(input_template_dir, "*.pkl")))
+                if not pkl_files:
+                    print(f"No .pkl files found in '{input_template_dir}'. Skipping this template.")
+                    continue
+                for pkl_file in pkl_files:
+                    with open(pkl_file, "rb") as f:
+                        query_data = pickle.load(f)
+                        sql_query = query_data.get("sql")
+                        sql_query = remove_unnecessary_parentheses(sql_query)
+                        if sql_query:
+                            self.workload.append(sql_query)
+        else:
+            try:
+                with open(self.base_query_dir, "r") as f:
+                    lines = f.readlines()
+            except Exception as e:
+                print(f"Error loading {self.base_query_dir}: {e}")
+                return
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+
+                parts = line.split("||")
+                sql_str = parts[0].strip()
+
+                # 如果sql中最前面有/* (st_u) */ 这种注释，去掉它
+                if sql_str.startswith("/*"):
+                    sql_str = sql_str.split("*/", 1)[-1].strip()
+
+                if "SELECT" not in sql_str.upper():
+                    continue
+
+                self.workload.append(sql_str)
 
         print("Initialization complete.")
         print(f"Loaded {len(self.workload)} queries from workload.")
@@ -154,6 +246,8 @@ class Sampler:
         }
         """
 
+        time_start = time.time()
+
         print("Parsing workload queries...")
 
         all_parsed_queries : Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -194,9 +288,11 @@ class Sampler:
                                 lambda node: exp.Column(this=node.this) if isinstance(node, exp.Column) and node.table else node
                             )
                             predicate_sql = combined_conditions_no_alias.sql(dialect="postgres")
+                            if self.config["db"]["name"] == "stats":
+                                predicate_sql = convert_timestamps_in_sql(predicate_sql)
                             all_parsed_queries[table_name].append({
                                 # "query_id": query_id,
-                                # "original_text": query,
+                                "original_text": query,
                                 "table_name": table_name,
                                 "predicate_sql": predicate_sql
                             })
@@ -222,7 +318,7 @@ class Sampler:
             total_unique_predicates += len(unique_queries_by_table[table])
             print(f"Table '{table}': {len(queries)} raw predicates -> {len(unique_queries_by_table[table])} unique predicates.")
 
-        print(f"Workload parsed. Found relevant queries for {len(all_parsed_queries)} tables.")
+        print(f"Workload parsed. Found relevant queries for {len(all_parsed_queries)} tables. Time taken: {time.time() - time_start:.2f} seconds.")
         return unique_queries_by_table
 
 
@@ -369,8 +465,16 @@ class Sampler:
 
     def sample(self):
         """Main sampling function that orchestrates the sampling process."""
+        all_time_start = time.time()
+
         parsed_workload = self.parse_workload()
         for table, queries in parsed_workload.items():
+
+            if table != "posthistory":
+                continue
+
+            time_start = time.time()
+
             print(f"Sampling for table {table} with {len(queries)} relevant queries...")
             self.samples[table] = []
             is_small, partitions = self.partition_table(table)
@@ -384,6 +488,8 @@ class Sampler:
             num_total_queries = len(queries)
 
             for j in range(self.k_bitmaps):
+                time_start_bitmap = time.time()
+
                 print(f"Constructing bitmap {j+1}/{self.k_bitmaps} for table {table}...")
 
                 if len(covered_queries) == num_total_queries:
@@ -411,7 +517,21 @@ class Sampler:
                         print(f"    Warning: No tuple selected for this partition.")
 
                 self.samples[table].append(current_bitmap)
-                print(f"--- Bitmap {j+1} for '{table}' constructed. Final size: {len(current_bitmap)} ---")
+                time_end_bitmap = time.time()
+                print(f"--- Bitmap {j+1} for '{table}' constructed. Final size: {len(current_bitmap)}. Time taken: {time_end_bitmap - time_start_bitmap:.2f} seconds ---")
+
+            time_end = time.time()
+            print(f"=== Sampling for table '{table}' completed. Total time: {time_end - time_start:.2f} seconds ===\n")
+
+            # 打印出没有覆盖的谓词
+            uncovered_queries = [q for i, q in enumerate(queries) if i not in covered_queries]
+            if uncovered_queries:
+                print(f"Uncovered predicates for table '{table}':")
+                for uq in uncovered_queries:
+                    print(f"  predicate: {uq['predicate_sql']} | original query: {uq['original_text']}")
+
+        all_time_end = time.time()
+        print(f"All sampling completed. Total time taken: {all_time_end - all_time_start:.2f} seconds.")
     
     def save_samples(self, output_path: str):
         """Saves the sampled data to a JSON file."""
@@ -427,10 +547,10 @@ class Sampler:
         print("Database connection closed.")
 
 if __name__ == "__main__":
-    sampler = Sampler("/data2/xuyining/Sampler/single_table/ceb_imdb_results/1000/sampler_config.json")
+    sampler = Sampler("/data2/xuyining/Sampler/single_table/workloads/stats/sampler_config.json")
     try:
         sampler.sample()
-        sampler.save_samples("/data2/xuyining/Sampler/single_table/ceb_imdb_results/1000/samples.json")
+        # sampler.save_samples("/data2/xuyining/Sampler/single_table/workloads/genome/100/samples.json")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
