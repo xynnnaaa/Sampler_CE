@@ -234,7 +234,8 @@ class JoinSampler:
             "host": db_conf.get("host", "localhost"),
             "port": db_conf.get("port", 5432),
             "dbname": db_conf.get("dbname", "imdb"),
-            "user": db_conf.get("user", "your_username")
+            "user": db_conf.get("user", "your_username"),
+            "password": db_conf.get("password", "123")
         }
 
         try:
@@ -896,7 +897,7 @@ class JoinSampler:
                 'score': score
             })
 
-        if not current_beam: return None, 0.0
+        if not current_beam: return None, execute_time_total
 
         # # root剪枝，添加扰动
         # current_beam.sort(key=lambda x: x['score'], reverse=True)
@@ -950,7 +951,7 @@ class JoinSampler:
             t_sample_end = time.time()
             execute_time_total += execute_time
 
-            if not candidates: return None, 0.0
+            if not candidates: return None, execute_time_total
 
             next_candidates_heap = []
             for cand in candidates:
@@ -976,7 +977,7 @@ class JoinSampler:
 
             sorted_cands = sorted(next_candidates_heap, key=lambda x: x[0], reverse=True)
             
-            if not sorted_cands: return None, 0.0
+            if not sorted_cands: return None, execute_time_total
 
             current_beam = []
             for score, counter, data, bmp in sorted_cands:
@@ -1146,7 +1147,7 @@ class JoinSampler:
         # 在开始采样前，加载已有的 samples_batch_*.json，记录已生成的 template_id，用于跳过
         existing_templates = self.load_existing_template_ids(cur_output_path)
 
-        SAVE_BATCH_SIZE = 10
+        SAVE_BATCH_SIZE = 5
         current_batch_samples = {}
         processed_count = 0
         batch_index = 0
