@@ -265,7 +265,7 @@ class JoinSampler:
         if self.engine: self.engine.close()
         print("Resources released.")
 
-    def load_and_parse_workload(self):
+    def load_and_parse_workload(self, worker_id=0, num_workers=1):
         self.temp_template_data = defaultdict(lambda: {'instances':[], 'graph': None})
         try:
             with open(self.sql_file, 'r') as f:
@@ -273,6 +273,8 @@ class JoinSampler:
         except Exception as e:
             print(f"Error loading {self.sql_file}: {e}")
             return
+        
+        cur_worker_query_count = 0
         
         for line_idx, line in enumerate(lines):
             line = line.strip()
@@ -331,6 +333,8 @@ class JoinSampler:
                 else:
                     current_query_pids[alias] = -1 
 
+            cur_worker_query_count += 1
+
             if template_key not in self.temp_template_data:
                 self.temp_template_data[template_key]['graph'] = join_graph.copy()
                 self.temp_template_data[template_key]['real_names'] = {a: join_graph.nodes[a]["real_name"] for a in sorted_aliases}
@@ -338,6 +342,8 @@ class JoinSampler:
             # Store q_idx inherently via list length
             q_idx = len(self.temp_template_data[template_key]['instances'])
             self.temp_template_data[template_key]['instances'].append(current_query_pids)
+
+        print(f"Worker {worker_id} parsed {cur_worker_query_count} queries into {len(self.temp_template_data)} unique templates.")
 
     def add_sel_info_to_graph(self, join_graph):
         for node, info in join_graph.nodes(data=True):
@@ -465,11 +471,34 @@ class JoinSampler:
 
                 node.relevant_qids = my_relevant
                 node.current_qids = my_query
+
+                node.relevant_qids_mask = 0
+                for qid in my_relevant:
+                    node.relevant_qids_mask |= (1 << qid)
+
+                node.current_qids_mask = 0
+                for qid in my_query:
+                    node.current_qids_mask |= (1 << qid)
+
                 return my_relevant
             
             assign_and_aggregate(root_node)
             root_node.subtree_total_queries = current_qid_counter
-            print(f"  Root '{root_node.child_alias}' ({root_node.real_name}): {current_qid_counter} queries.")
+
+            # 输出树内包含的template总数，全部节点数量
+            total_templates = 0
+            total_nodes = 0
+            def count_templates_and_nodes(node):
+                nonlocal total_templates, total_nodes
+                total_nodes += 1
+                if node.is_template_end:
+                    total_templates += len(node.end_template_keys)
+                for child in node.children.values():
+                    count_templates_and_nodes(child)
+
+            count_templates_and_nodes(root_node)
+
+            print(f"  Root '{root_node.child_alias}' ({root_node.real_name}): {current_qid_counter} queries, {total_templates} templates, {total_nodes} nodes.")
 
     def prepare_subtree_pid_map(self, root_node):
         subtree_instances = {}
@@ -493,8 +522,12 @@ class JoinSampler:
 
     def partition_root_table(self, real_name, m_partitions):
         try:
-            self.cursor.execute(f"SELECT id FROM {real_name} ORDER BY RANDOM();")
+            self.cursor.execute(f"SELECT id FROM {real_name};")
             all_ids =[row[0] for row in self.cursor.fetchall()]
+
+            import random
+            random.shuffle(all_ids)
+
             total_rows = len(all_ids)
             if total_rows < m_partitions:
                 return [[all_ids[i % total_rows]] for i in range(m_partitions)]
@@ -512,12 +545,12 @@ class JoinSampler:
 
     # ================= 核心执行逻辑 =================
 
-    def _get_uncovered_mask(self, relevant_qids, covered_mask_int):
-        mask = 0
-        for qid in relevant_qids:
-            if not (covered_mask_int & (1 << qid)):
-                mask |= (1 << qid)
-        return mask
+    # def _get_uncovered_mask(self, relevant_qids, covered_mask_int):
+    #     mask = 0
+    #     for qid in relevant_qids:
+    #         if not (covered_mask_int & (1 << qid)):
+    #             mask |= (1 << qid)
+    #     return mask
     
     def execute_root_step(self, root_node, partition_ids, pid_map, global_map, subtree_covered_mask):
         """
@@ -525,36 +558,65 @@ class JoinSampler:
         """
         if not partition_ids: return False
 
-        uncovered_mask_int = self._get_uncovered_mask(root_node.relevant_qids, subtree_covered_mask)
+        uncovered_mask_int = root_node.relevant_qids_mask & ~subtree_covered_mask
         if uncovered_mask_int == 0: return False
 
-        neighbors, _ = self.engine._batch_fetch_neighbors(
-            root_node.real_name, "id", partition_ids, root_node.sels, root_node.child_alias
-        )
+        # 设置内部数据库获取的批大小，以及允许进入下一阶段的 Root 元组最大上限
+        FETCH_BATCH_SIZE = 2000
+        MAX_ROOT_CANDIDATES = 2000
 
-        translated_map, _ = self.engine._batch_fetch_translate_bitmaps(
-            root_node.real_name, partition_ids,
-            workload_name=self.workload_name, alias=root_node.child_alias,
-            pid_map=pid_map.get(root_node.child_alias, {}),
-            global_map=global_map.get(root_node.child_alias, 0)
-        )
+        all_candidate_tuples = [] # 暂存格式: (score, clean_data, qid_mask)
 
-        root_paths =[]
-        for pid in set(partition_ids):
-            p_val = str(pid)
-            rows = neighbors.get(p_val,[])
-            if not rows: continue
-            
-            row_data = rows[0]
-            qid_mask = translated_map.get(p_val, global_map.get(root_node.child_alias, 0))
+        for chunk_start in range(0, len(partition_ids), FETCH_BATCH_SIZE):
+            chunk = partition_ids[chunk_start:chunk_start + FETCH_BATCH_SIZE]
 
-            # 剪枝
-            if (qid_mask & uncovered_mask_int) == 0:
-                continue
+            neighbors, _ = self.engine._batch_fetch_neighbors(
+                root_node.real_name, "id", chunk, root_node.sels, root_node.child_alias
+            )
 
-            clean_data = {k: v for k, v in row_data.items() if k != '_bmp_str'}
+            translated_map, _ = self.engine._batch_fetch_translate_bitmaps(
+                root_node.real_name, chunk,
+                workload_name=self.workload_name, alias=root_node.child_alias,
+                pid_map=pid_map.get(root_node.child_alias, {}),
+                global_map=global_map.get(root_node.child_alias, 0)
+            )
 
-            # [核心逻辑] Monte Carlo ：每个 Root 元组复制 w 份，形成 w 条平行路径
+            for pid in set(partition_ids):
+                p_val = str(pid)
+                rows = neighbors.get(p_val,[])
+                if not rows: continue
+                
+                row_data = rows[0]
+                qid_mask = translated_map.get(p_val, global_map.get(root_node.child_alias, 0))
+
+                # 剪枝
+                local_uncovered = qid_mask & uncovered_mask_int
+                if local_uncovered == 0:
+                    continue
+
+                score = bin(local_uncovered).count('1')
+                clean_data = {k: v for k, v in row_data.items() if k != '_bmp_str'}
+
+                all_candidate_tuples.append((score, clean_data, qid_mask))
+
+            # # [核心逻辑] Monte Carlo ：每个 Root 元组复制 w 份，形成 w 条平行路径
+            # for _ in range(self.w_samples):
+            #     root_paths.append({
+            #         'vals': clean_data.copy(),
+            #         'acc_bmp': qid_mask,
+            #         'alive': True
+            #     })
+
+        # 按分数排序，挑出前 MAX_ROOT_CANDIDATES 个 Root 元组
+        if not all_candidate_tuples:
+            return False
+        
+        all_candidate_tuples.sort(key=lambda x: x[0], reverse=True)
+        top_candidates = all_candidate_tuples[:MAX_ROOT_CANDIDATES]
+
+        root_paths = []
+
+        for score, clean_data, qid_mask in top_candidates:
             for _ in range(self.w_samples):
                 root_paths.append({
                     'vals': clean_data.copy(),
@@ -572,7 +634,7 @@ class JoinSampler:
         collected_samples = defaultdict(list)
         newly_covered_global = 0
 
-        uncovered_mask_int = self._get_uncovered_mask(current_node.relevant_qids, subtree_covered_mask)
+        uncovered_mask_int = current_node.relevant_qids_mask & ~subtree_covered_mask
         if uncovered_mask_int == 0: 
             current_node.cached_paths =[]
             return collected_samples, newly_covered_global
@@ -638,11 +700,14 @@ class JoinSampler:
             score = 0
             newly_covered_mask = 0
             
-            # 只关心当前模板所包含的查询 (current_qids)
-            for qid in node.current_qids:
-                if (anno_bits & (1 << qid)) and not (current_covered_mask & (1 << qid)):
-                    score += 1
-                    newly_covered_mask |= (1 << qid)
+            # # 只关心当前模板所包含的查询 (current_qids)
+            # for qid in node.current_qids:
+            #     if (anno_bits & (1 << qid)) and not (current_covered_mask & (1 << qid)):
+            #         score += 1
+            #         newly_covered_mask |= (1 << qid)
+
+            newly_covered_mask = anno_bits & node.current_qids_mask & ~current_covered_mask
+            score = bin(newly_covered_mask).count('1')
             
             if score > best_score:
                 best_score = score
@@ -770,7 +835,10 @@ class JoinSampler:
         print(f"Starting Join Sampling Process (Worker {worker_id}/{num_workers})...")
         t_start = time.time()
         
-        self.load_and_parse_workload()
+        self.load_and_parse_workload(worker_id, num_workers)
+
+        print(f"Parsed templates across all queries in {time.time() - t_start:.2f}s.")
+
         if not self.temp_template_data:
             print("No templates parsed. Exiting.")
             return

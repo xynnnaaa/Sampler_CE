@@ -395,22 +395,165 @@ class JoinSampler:
 
     # ================= 核心独立执行逻辑 =================
 
-    def sample_for_one_template(self, template_id, template_data):
-        """
-        对单个 Template 执行 Monte Carlo Random Walk。
-        严格不使用缓存和树结构。
-        """
+    # def sample_for_one_template(self, template_id, template_data):
+    #     """
+    #     对单个 Template 执行 Monte Carlo Random Walk。
+    #     严格不使用缓存和树结构。
+    #     """
 
-        self.engine.bitmap_cache.clear()
+    #     self.engine.bitmap_cache.clear()
 
         
+    #     join_graph = template_data['graph']
+    #     self.add_sel_info_to_graph(join_graph)
+    #     aliases = list(template_id[0])
+    #     instances = template_data['instances']
+        
+    #     join_execution_plan = self.build_join_tree_structure(join_graph, aliases)
+    #     root_info = join_execution_plan[0]
+        
+    #     partitions = self.partition_root_table(root_info['real_name'], self.m_partitions)
+    #     pid_map, global_map, total_qids = self.prepare_template_pid_map(instances)
+        
+    #     target_full_mask = (1 << total_qids) - 1
+    #     template_covered_mask = 0
+        
+    #     all_k_samples = []
+
+    #     for k_idx in range(self.k_bitmaps):
+    #         print(f"    --> Bitmap {k_idx+1}/{self.k_bitmaps}...", flush=True)
+            
+    #         current_bitmap_samples = []
+
+    #         for p_idx, partition_ids in enumerate(partitions):
+    #             if not partition_ids: continue
+                
+    #             t_p = time.time()
+                
+    #             # 1. 剪枝检查：看当前还缺多少覆盖
+    #             uncovered_mask_int = target_full_mask & ~template_covered_mask
+    #             if uncovered_mask_int == 0:
+    #                 break
+
+    #             # 2. Root 抓取
+    #             neighbors, _ = self.engine._batch_fetch_neighbors(
+    #                 root_info['real_name'], "id", partition_ids, root_info['sels'], root_info['alias']
+    #             )
+
+    #             translated_map, _ = self.engine._batch_fetch_translate_bitmaps(
+    #                 root_info['real_name'], partition_ids,
+    #                 workload_name=self.workload_name, alias=root_info['alias'],
+    #                 pid_map=pid_map.get(root_info['alias'], {}),
+    #                 global_map=global_map.get(root_info['alias'], 0)
+    #             )
+
+    #             # 3. 构建初始平行路径
+    #             active_paths = []
+    #             for pid in set(partition_ids):
+    #                 p_val = str(pid)
+    #                 rows = neighbors.get(p_val, [])
+    #                 if not rows: continue
+                    
+    #                 row_data = rows[0]
+    #                 qid_mask = translated_map.get(p_val, global_map.get(root_info['alias'], 0))
+                    
+    #                 # [极速剪枝]
+    #                 if (qid_mask & uncovered_mask_int) == 0:
+    #                     continue
+                        
+    #                 clean_data = {k: v for k, v in row_data.items() if k != '_bmp_str'}
+
+    #                 # Monte Carlo 裂变 w 次
+    #                 for _ in range(self.w_samples):
+    #                     active_paths.append({
+    #                         'vals': clean_data.copy(),
+    #                         'acc_bmp': qid_mask,
+    #                         'alive': True
+    #                     })
+
+    #             if not active_paths:
+    #                 continue
+
+    #             # 4. 线性向下走 (Wander Join 直到模板末尾)
+    #             for step in join_execution_plan[1:]:
+    #                 step_info = {
+    #                     'alias': step['alias'],
+    #                     'real_name': step['real_name'],
+    #                     'parent': step['parent'],
+    #                     'join_condition': step['join_condition'],
+    #                     'sels': step['sels']
+    #                 }
+                    
+    #                 active_paths = self.engine.extend_paths_one_step(
+    #                     active_paths, step_info, pid_map, global_map, self.workload_name
+    #                 )
+                    
+    #                 if not active_paths:
+    #                     break 
+                
+    #             # 5. 打分挑最好
+    #             if not active_paths:
+    #                 continue
+
+    #             best_path = None
+    #             best_score = -1
+    #             best_new_cov = 0
+                
+    #             for path in active_paths:
+    #                 anno_bits = path['acc_bmp']
+    #                 score = bin(anno_bits & uncovered_mask_int).count('1')
+    #                 if score > best_score:
+    #                     best_score = score
+    #                     best_path = path
+    #                     best_new_cov = anno_bits & uncovered_mask_int
+                        
+    #             if not best_path:
+    #                 best_path = active_paths[0]
+                    
+    #             # 提取最佳结果
+    #             sample_dict = {}
+    #             for k, v in best_path['vals'].items():
+    #                 if k.endswith(".id") or k.endswith(".Id"):
+    #                     alias = k.split('.')[0]
+    #                     sample_dict[alias] = v
+                
+    #             current_bitmap_samples.append(sample_dict)
+    #             template_covered_mask |= best_new_cov
+                
+    #             cov_count = bin(template_covered_mask).count('1')
+    #             print(f"        Partition {p_idx+1}/{len(partitions)} done in {time.time()-t_p:.2f}s. Coverage: {cov_count}/{total_qids}")
+
+    #             if bin(template_covered_mask).count('1') / total_qids >= 0.99:
+    #                 print(f"        Coverage reached 99% after partition {p_idx+1}. Stop sampling partitions.")
+    #                 break
+
+    #         all_k_samples.append(current_bitmap_samples)
+            
+    #         if bin(template_covered_mask).count('1') / total_qids >= 0.99:
+    #             print(f"        Coverage reached 99%. Stop sampling further bitmaps.")
+    #             break
+                
+    #     return all_k_samples
+
+
+    def sample_for_one_template(self, template_id, template_data):
+        """
+        [优化同步版] 对单个 Template 执行 Monte Carlo Random Walk。
+        同步了树状结构的内部 Mini-Batch 分批与 Root 层 Top-K 掩码打分剪枝，确保公平对比。
+        """
+        self.engine.bitmap_cache.clear()
+
         join_graph = template_data['graph']
         self.add_sel_info_to_graph(join_graph)
         aliases = list(template_id[0])
         instances = template_data['instances']
         
-        join_execution_plan = self.build_join_tree_structure(join_graph, aliases)
-        root_info = join_execution_plan[0]
+        try:
+            join_execution_plan = self.build_join_tree_structure(join_graph, aliases)
+            root_info = join_execution_plan[0]
+        except Exception as e:
+            print(f"Error building join tree for template {template_id}: {e}")
+            return []
         
         partitions = self.partition_root_table(root_info['real_name'], self.m_partitions)
         pid_map, global_map, total_qids = self.prepare_template_pid_map(instances)
@@ -422,7 +565,6 @@ class JoinSampler:
 
         for k_idx in range(self.k_bitmaps):
             print(f"    --> Bitmap {k_idx+1}/{self.k_bitmaps}...", flush=True)
-            
             current_bitmap_samples = []
 
             for p_idx, partition_ids in enumerate(partitions):
@@ -435,41 +577,61 @@ class JoinSampler:
                 if uncovered_mask_int == 0:
                     break
 
-                # 2. Root 抓取
-                neighbors, _ = self.engine._batch_fetch_neighbors(
-                    root_info['real_name'], "id", partition_ids, root_info['sels'], root_info['alias']
-                )
+                # ==================== 【同步优化：2 & 3. 内部 Mini-Batch 与 Top-K 剪枝】 ====================
+                FETCH_BATCH_SIZE = 2000
+                MAX_ROOT_CANDIDATES = 2000
+                all_candidate_tuples = [] # 暂存格式: (score, clean_data, qid_mask)
 
-                translated_map, _ = self.engine._batch_fetch_translate_bitmaps(
-                    root_info['real_name'], partition_ids,
-                    workload_name=self.workload_name, alias=root_info['alias'],
-                    pid_map=pid_map.get(root_info['alias'], {}),
-                    global_map=global_map.get(root_info['alias'], 0)
-                )
+                # 内部按 2000 分批拉取数据库，保护 PostgreSQL 驱动
+                for chunk_start in range(0, len(partition_ids), FETCH_BATCH_SIZE):
+                    chunk = partition_ids[chunk_start : chunk_start + FETCH_BATCH_SIZE]
 
-                # 3. 构建初始平行路径
-                active_paths = []
-                for pid in set(partition_ids):
-                    p_val = str(pid)
-                    rows = neighbors.get(p_val, [])
-                    if not rows: continue
-                    
-                    row_data = rows[0]
-                    qid_mask = translated_map.get(p_val, global_map.get(root_info['alias'], 0))
-                    
-                    # [极速剪枝]
-                    if (qid_mask & uncovered_mask_int) == 0:
-                        continue
+                    neighbors, _ = self.engine._batch_fetch_neighbors(
+                        root_info['real_name'], "id", chunk, root_info['sels'], root_info['alias']
+                    )
+
+                    translated_map, _ = self.engine._batch_fetch_translate_bitmaps(
+                        root_info['real_name'], chunk,
+                        workload_name=self.workload_name, alias=root_info['alias'],
+                        pid_map=pid_map.get(root_info['alias'], {}),
+                        global_map=global_map.get(root_info['alias'], 0)
+                    )
+
+                    # 逐个元组计算局部掩码得分
+                    for pid in set(chunk):
+                        p_val = str(pid)
+                        rows = neighbors.get(p_val, [])
+                        if not rows: continue
                         
-                    clean_data = {k: v for k, v in row_data.items() if k != '_bmp_str'}
+                        row_data = rows[0]
+                        qid_mask = translated_map.get(p_val, global_map.get(root_info['alias'], 0))
+                        
+                        # 初筛：不满足任何当前缺失查询的直接丢弃
+                        local_uncovered = qid_mask & uncovered_mask_int
+                        if local_uncovered == 0:
+                            continue
+                            
+                        score = bin(local_uncovered).count('1')
+                        clean_data = {k: v for k, v in row_data.items() if k != '_bmp_str'}
+                        all_candidate_tuples.append((score, clean_data, qid_mask))
 
-                    # Monte Carlo 裂变 w 次
+                if not all_candidate_tuples:
+                    continue
+
+                # 按 Root 层覆盖贡献度从高到低排序，切出最优的 Top-K 种子
+                all_candidate_tuples.sort(key=lambda x: x[0], reverse=True)
+                top_candidates = all_candidate_tuples[:MAX_ROOT_CANDIDATES]
+
+                # 对筛选出的优质种子元组进行 Monte Carlo 裂变（w_samples 份）
+                active_paths = []
+                for score, clean_data, qid_mask in top_candidates:
                     for _ in range(self.w_samples):
                         active_paths.append({
                             'vals': clean_data.copy(),
                             'acc_bmp': qid_mask,
                             'alive': True
                         })
+                # =======================================================================================
 
                 if not active_paths:
                     continue
@@ -489,7 +651,7 @@ class JoinSampler:
                     )
                     
                     if not active_paths:
-                        break # 此分区全军覆没
+                        break 
                 
                 # 5. 打分挑最好
                 if not active_paths:
@@ -574,6 +736,9 @@ class JoinSampler:
         t_start = time.time()
         
         self.load_and_parse_workload()
+
+        print(f"Parsed templates across all queries in {time.time() - t_start:.2f}s.")
+        
         if not self.temp_template_data:
             print("No templates parsed. Exiting.")
             return
@@ -598,7 +763,11 @@ class JoinSampler:
             aliases_tuple = template_key[0]
             print(f"\n=== Processing Template: {aliases_tuple} ===")
             
-            samples = self.sample_for_one_template(template_key, template_data)
+            try:
+                samples = self.sample_for_one_template(template_key, template_data)
+            except Exception as e:
+                print(f"Error sampling template {template_key}: {e}")
+                samples = []
             current_batch_results[template_key] = samples
             processed += 1
             

@@ -308,21 +308,21 @@ class JoinSampler:
             print(f"Error loading {self.sql_file}: {e}")
             return
 
-        # try:
-        #     with open("/data2/xuyining/PRICE/datas/workloads/test/ergastf1/workloads.sql", 'r') as f:
-        #         lines_1 = f.readlines()
-        # except Exception as e:
-        #     print(f"Error loading {self.sql_file}: {e}")
-        #     return
+        try:
+            with open("/home/PRICE/datas/tpch/train.sql", 'r') as f:
+                lines_1 = f.readlines()
+        except Exception as e:
+            print(f"Error loading {self.sql_file}: {e}")
+            return
         
-        # try:
-        #     with open("/data2/xuyining/PRICE/datas/workloads/finetune/ergastf1/workloads.sql", 'r') as f:
-        #         lines_2 = f.readlines()
-        # except Exception as e:
-        #     print(f"Error loading {self.sql_file}: {e}")
-        #     return
+        try:
+            with open("/home/PRICE/datas/tpch/test_sub.sql", 'r') as f:
+                lines_2 = f.readlines()
+        except Exception as e:
+            print(f"Error loading {self.sql_file}: {e}")
+            return
         
-        # lines = lines_1 + lines_2
+        lines = lines_1 + lines_2
         
         for line_idx, line in enumerate(lines):
             line = line.strip()
@@ -1133,100 +1133,100 @@ class JoinSampler:
         start_time = time.time()
         self.load_and_parse_workload() 
         print(f"Total Join Templates Loaded: {len(self.join_templates)}, Workload Parsing Time: {time.time() - start_time:.2f}s")
-        self.create_annotation_tables()
-        if not self.join_templates:
-            print("No join templates found. Exiting.")
-            return
+        # self.create_annotation_tables()
+        # if not self.join_templates:
+        #     print("No join templates found. Exiting.")
+        #     return
         
-        cur_output_path = os.path.join(self.output_path, str(worker_id))
+        # cur_output_path = os.path.join(self.output_path, str(worker_id))
 
-        if not os.path.exists(cur_output_path):
-            os.makedirs(cur_output_path)
-            print(f"Created output directory: {cur_output_path}")
+        # if not os.path.exists(cur_output_path):
+        #     os.makedirs(cur_output_path)
+        #     print(f"Created output directory: {cur_output_path}")
 
-        # 在开始采样前，加载已有的 samples_batch_*.json，记录已生成的 template_id，用于跳过
-        existing_templates = self.load_existing_template_ids(cur_output_path)
+        # # 在开始采样前，加载已有的 samples_batch_*.json，记录已生成的 template_id，用于跳过
+        # existing_templates = self.load_existing_template_ids(cur_output_path)
 
-        SAVE_BATCH_SIZE = 5
-        current_batch_samples = {}
-        processed_count = 0
-        batch_index = 0
+        # SAVE_BATCH_SIZE = 5
+        # current_batch_samples = {}
+        # processed_count = 0
+        # batch_index = 0
 
-        all_items = list(self.join_templates.items())
-        my_tasks = []
-        skipped = 0
-        # 构建分配给当前 worker 的任务列表，跳过已经存在的 template，并将已存在的计入 processed_count
-        for i, item in enumerate(all_items):
-            if i % num_workers == worker_id:
-                template_id = item[0]
-                if template_id in existing_templates:
-                    skipped += 1
-                    processed_count += 1
-                    continue
-                my_tasks.append(item)
+        # all_items = list(self.join_templates.items())
+        # my_tasks = []
+        # skipped = 0
+        # # 构建分配给当前 worker 的任务列表，跳过已经存在的 template，并将已存在的计入 processed_count
+        # for i, item in enumerate(all_items):
+        #     if i % num_workers == worker_id:
+        #         template_id = item[0]
+        #         if template_id in existing_templates:
+        #             skipped += 1
+        #             processed_count += 1
+        #             continue
+        #         my_tasks.append(item)
 
-        # 初始化 batch_index 使之与已存在的 processed_count 对齐，避免覆盖已有批次文件
-        batch_index = processed_count // SAVE_BATCH_SIZE
-        if skipped:
-            print(f"Worker {worker_id}: Skipped {skipped} templates already generated. Initialized processed_count={processed_count}, batch_index={batch_index}.")
-        print(f"Worker {worker_id}: Assigned {len(my_tasks)}/{len(all_items)} templates.")
+        # # 初始化 batch_index 使之与已存在的 processed_count 对齐，避免覆盖已有批次文件
+        # batch_index = processed_count // SAVE_BATCH_SIZE
+        # if skipped:
+        #     print(f"Worker {worker_id}: Skipped {skipped} templates already generated. Initialized processed_count={processed_count}, batch_index={batch_index}.")
+        # print(f"Worker {worker_id}: Assigned {len(my_tasks)}/{len(all_items)} templates.")
 
-        for template_id, template_data in my_tasks:
-            if len(template_data['aliases']) < 2:
-                # print(f"\n=== Skipping Template: {template_id} (only {len(template_data['aliases'])} table) ===")
-                continue
+        # for template_id, template_data in my_tasks:
+        #     if len(template_data['aliases']) < 2:
+        #         # print(f"\n=== Skipping Template: {template_id} (only {len(template_data['aliases'])} table) ===")
+        #         continue
 
-            print(f"\n=== Processing Template: {template_id} ===")
-            print(f"    Tables: {template_data['aliases']}")
-            print(f"    Total Queries in Group: {template_data['queries_count']}")
+        #     print(f"\n=== Processing Template: {template_id} ===")
+        #     print(f"    Tables: {template_data['aliases']}")
+        #     print(f"    Total Queries in Group: {template_data['queries_count']}")
 
-            self.add_sel_info_to_graph(template_data)
+        #     self.add_sel_info_to_graph(template_data)
 
-            join_graph = template_data['join_graph']
-            aliases = template_data['aliases']
+        #     join_graph = template_data['join_graph']
+        #     aliases = template_data['aliases']
 
-            try:
-                join_order_tree, root_table = self.build_join_tree_structure(join_graph, aliases)
-                print(f"    Join Root: {root_table}")
-                partitions = self.partition_root_table(root_table=root_table, 
-                                                        m_partitions=self.m_partitions, 
-                                                        template_data=template_data)
-                print(f"    Root table partitioned into {len(partitions)} segments.")
-                time_sampling_start = time.time()
+        #     try:
+        #         join_order_tree, root_table = self.build_join_tree_structure(join_graph, aliases)
+        #         print(f"    Join Root: {root_table}")
+        #         partitions = self.partition_root_table(root_table=root_table, 
+        #                                                 m_partitions=self.m_partitions, 
+        #                                                 template_data=template_data)
+        #         print(f"    Root table partitioned into {len(partitions)} segments.")
+        #         time_sampling_start = time.time()
 
-                template_samples = self.sample_for_one_template(
-                        partitions=partitions,
-                        root_table=root_table,
-                        join_order_tree=join_order_tree,
-                        template_data=template_data
-                    )
+        #         template_samples = self.sample_for_one_template(
+        #                 partitions=partitions,
+        #                 root_table=root_table,
+        #                 join_order_tree=join_order_tree,
+        #                 template_data=template_data
+        #             )
                 
-                current_batch_samples[template_id] = template_samples
-                processed_count += 1
-                print(f"    Sampling completed in {time.time() - time_sampling_start:.2f}s.")
+        #         current_batch_samples[template_id] = template_samples
+        #         processed_count += 1
+        #         print(f"    Sampling completed in {time.time() - time_sampling_start:.2f}s.")
 
-                if processed_count % SAVE_BATCH_SIZE == 0:
-                    batch_filename = f"samples_batch_{batch_index}.json"
-                    batch_full_path = os.path.join(cur_output_path, batch_filename)
-                    self.save_samples(current_batch_samples, batch_full_path)
-                    print(f"    >>> Saved batch {batch_index} (Templates {processed_count - SAVE_BATCH_SIZE + 1} to {processed_count}), Used Time: {time.time() - start_time:.2f}s")
-                    batch_index += 1
-                    current_batch_samples = {}
+        #         if processed_count % SAVE_BATCH_SIZE == 0:
+        #             batch_filename = f"samples_batch_{batch_index}.json"
+        #             batch_full_path = os.path.join(cur_output_path, batch_filename)
+        #             self.save_samples(current_batch_samples, batch_full_path)
+        #             print(f"    >>> Saved batch {batch_index} (Templates {processed_count - SAVE_BATCH_SIZE + 1} to {processed_count}), Used Time: {time.time() - start_time:.2f}s")
+        #             batch_index += 1
+        #             current_batch_samples = {}
 
-            except Exception as e:
-                print(f"ERROR processing template {template_id}: {e}")
+        #     except Exception as e:
+        #         print(f"ERROR processing template {template_id}: {e}")
                 
-                self.conn.rollback()
+        #         self.conn.rollback()
 
-                import traceback
-                traceback.print_exc()
+        #         import traceback
+        #         traceback.print_exc()
         
-        if current_batch_samples:
-            batch_filename = f"samples_batch_{batch_index}.json"
-            batch_full_path = os.path.join(cur_output_path, batch_filename)
-            self.save_samples(current_batch_samples, batch_full_path)
-            print(f"    >>> Saved final batch {batch_index} (Templates {processed_count - len(current_batch_samples) + 1} to {processed_count})...")
-        print(f"\nAll tasks finished. Results saved to directory: {self.output_path}. Total Time: {time.time() - start_time:.2f}s")
+        # if current_batch_samples:
+        #     batch_filename = f"samples_batch_{batch_index}.json"
+        #     batch_full_path = os.path.join(cur_output_path, batch_filename)
+        #     self.save_samples(current_batch_samples, batch_full_path)
+        #     print(f"    >>> Saved final batch {batch_index} (Templates {processed_count - len(current_batch_samples) + 1} to {processed_count})...")
+        # print(f"\nAll tasks finished. Results saved to directory: {self.output_path}. Total Time: {time.time() - start_time:.2f}s")
 
     def save_samples(self, samples_dict, output_path):
         formatted_output = {}

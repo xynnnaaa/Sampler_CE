@@ -90,12 +90,14 @@ class Sampler:
             user=self.config["db"]["user"],
             host=self.config["db"]["host"],
             port=self.config["db"]["port"],
+            password=self.config["db"]["password"]
         )
         self.cursor = self.conn.cursor()
 
         self.base_query_dir = self.config["sampling"]["base_query_dir"]
         self.k_bitmaps = self.config["sampling"]["k_bitmaps"]
-        self.m_partitions = self.config["sampling"]["m_partitions"]
+        self.sample_size = self.config["sampling"]["m_partitions"]
+        self.m_partitions = self.sample_size // 2                   # 贪心算法占一半
         # self.primary_key = self.get_primary_key()
         self.samples: Dict[str, List[List[Any]]] = defaultdict(list)
         self.query_counter = 0
@@ -336,7 +338,7 @@ class Sampler:
         if n < self.m_partitions:
             print(f"Info: Table '{table}' size ({n}) is smaller than m_partitions ({self.m_partitions}). "
                   f"Skipping sampling and using all IDs.")
-            return True, row_ids
+            return True, row_ids, [row_ids]  # Return a single partition with all IDs
 
         base_size, remainder = divmod(n, self.m_partitions)
         partitions = []
@@ -345,7 +347,7 @@ class Sampler:
             size = base_size + (1 if i < remainder else 0)
             partitions.append(row_ids[start:start + size])
             start += size
-        return False, partitions
+        return False, row_ids, partitions
 
     def select_best_tuple_from_partition(
         self,
@@ -362,9 +364,14 @@ class Sampler:
         if not uncovered_queries_with_indices:
             return random.choice(partition_ids)
 
+        # 如果分区内元组太多了，随机选5000个剪枝
+
+        if len(partition_ids) > 5000:
+            partition_ids = random.sample(partition_ids, 5000)
+
         from collections import Counter
         tuple_scores = Counter()
-        BATCH_SIZE = 100
+        BATCH_SIZE = 500
         
         # primary_key_col = self.primary_key[table]
         primary_key_col = 'id'
@@ -409,6 +416,60 @@ class Sampler:
             return random.choice(partition_ids)
 
 
+    # def update_covered_queries(
+    #     self,
+    #     table: str,
+    #     selected_tuple: Any,
+    #     relevant_queries: List[Dict[str, Any]],
+    #     covered_queries: set
+    # ):
+    #     """Updates the set of covered queries based on the selected tuple."""
+    #     if not selected_tuple:
+    #         return
+
+    #     uncovered_queries_with_indices = [(i, q) for i, q in enumerate(relevant_queries) if i not in covered_queries]
+    #     if not uncovered_queries_with_indices:
+    #         return
+        
+    #     BATCH_SIZE = 100
+        
+    #     # pk_col = self.primary_key[table]
+    #     pk_col = 'id'
+    #     selected_tuple_str = str(selected_tuple)
+    #     newly_covered_indices = set()
+
+    #     for i in range(0, len(uncovered_queries_with_indices), BATCH_SIZE):
+    #         batch = uncovered_queries_with_indices[i:i + BATCH_SIZE]
+            
+    #         union_all_clauses = []
+    #         for index, query in batch:
+    #             union_all_clauses.append(
+    #                 f"""
+    #                 SELECT {index} AS result_index
+    #                 WHERE EXISTS (
+    #                     SELECT 1 FROM {table}
+    #                     WHERE {pk_col} = {selected_tuple_str} AND ({query['predicate_sql']})
+    #                 )
+    #                 """
+    #             )
+    #         if not union_all_clauses:
+    #             continue
+
+    #         batch_query = " UNION ALL ".join(union_all_clauses)
+
+    #         try:
+    #             self.cursor.execute(batch_query)
+    #             results = self.cursor.fetchall()
+    #             for (result_index,) in results:
+    #                 newly_covered_indices.add(result_index)
+    #         except Exception as e:
+    #             print(f"Error executing coverage update query on table {table}: {e}")
+    #             self.conn.rollback()
+    #             continue
+        
+    #     if newly_covered_indices:
+    #         covered_queries.update(newly_covered_indices)
+
     def update_covered_queries(
         self,
         table: str,
@@ -420,48 +481,50 @@ class Sampler:
         if not selected_tuple:
             return
 
-        uncovered_queries_with_indices = [(i, q) for i, q in enumerate(relevant_queries) if i not in covered_queries]
-        if not uncovered_queries_with_indices:
+        # 过滤出还未覆盖的查询及其索引
+        uncovered = [(i, q) for i, q in enumerate(relevant_queries) if i not in covered_queries]
+        if not uncovered:
             return
-        
-        BATCH_SIZE = 100
-        
-        # pk_col = self.primary_key[table]
+
+        BATCH_SIZE = 500  # 可根据 SQL 长度 / 列数适当调小
         pk_col = 'id'
         selected_tuple_str = str(selected_tuple)
-        newly_covered_indices = set()
 
-        for i in range(0, len(uncovered_queries_with_indices), BATCH_SIZE):
-            batch = uncovered_queries_with_indices[i:i + BATCH_SIZE]
-            
-            union_all_clauses = []
-            for index, query in batch:
-                union_all_clauses.append(
-                    f"""
-                    SELECT {index} AS result_index
-                    WHERE EXISTS (
-                        SELECT 1 FROM {table}
-                        WHERE {pk_col} = {selected_tuple_str} AND ({query['predicate_sql']})
-                    )
-                    """
+        for start in range(0, len(uncovered), BATCH_SIZE):
+            batch = uncovered[start:start + BATCH_SIZE]
+
+            # 为这批谓词构建一次性评估的 SELECT 列表
+            # 每个谓词生成一个列：col_<index> 表示 index 号查询是否满足
+            case_clauses = []
+            for idx, q in batch:
+                # 注意 predicate_sql 可能包含复杂表达式，直接放入 CASE WHEN
+                case_clauses.append(
+                    f"CASE WHEN ({q['predicate_sql']}) THEN 1 ELSE 0 END AS col_{idx}"
                 )
-            if not union_all_clauses:
-                continue
 
-            batch_query = " UNION ALL ".join(union_all_clauses)
+            # 组装查询：只取主键等于 selected_tuple 的那一行
+            select_list = ", ".join(case_clauses)
+            batch_query = f"""
+                SELECT {select_list}
+                FROM {table}
+                WHERE {pk_col} = {selected_tuple_str}
+            """
 
             try:
                 self.cursor.execute(batch_query)
-                results = self.cursor.fetchall()
-                for (result_index,) in results:
-                    newly_covered_indices.add(result_index)
+                row = self.cursor.fetchone()
             except Exception as e:
-                print(f"Error executing coverage update query on table {table}: {e}")
+                print(f"Error executing coverage batch query on table {table}: {e}")
                 self.conn.rollback()
                 continue
-        
-        if newly_covered_indices:
-            covered_queries.update(newly_covered_indices)
+
+            # 如果该行存在，检查哪些谓词被满足
+            if row is not None:
+                # row 的顺序与 batch 中的顺序一致
+                for col_idx, (idx, _) in enumerate(batch):
+                    if row[col_idx] == 1:          # CASE WHEN 返回 1 表示满足
+                        covered_queries.add(idx)
+            # 若 row is None（元组不存在），则本批所有谓词均不满足，原逻辑结果相同
 
     def sample(self):
         """Main sampling function that orchestrates the sampling process."""
@@ -470,14 +533,14 @@ class Sampler:
         parsed_workload = self.parse_workload()
         for table, queries in parsed_workload.items():
 
-            if table != "posthistory":
-                continue
+            # if table != "posthistory":
+            #     continue
 
             time_start = time.time()
 
             print(f"Sampling for table {table} with {len(queries)} relevant queries...")
             self.samples[table] = []
-            is_small, partitions = self.partition_table(table)
+            is_small, row_ids, partitions = self.partition_table(table)
             if is_small:
                 print(f"Table {table} is small. Skipping sampling.")
                 continue
@@ -497,6 +560,19 @@ class Sampler:
                     break
 
                 current_bitmap = []
+
+                # ================= 新增：阶段一 随机抽样 =================
+                print(f"  [Phase 1] Random sampling {self.m_partitions} tuples...")
+                # 从全表 row_ids 中随机抽样 sample_size // 2 个
+                random_selected = random.sample(row_ids, self.m_partitions) 
+                current_bitmap.extend(random_selected)
+
+                for tuple_id in random_selected:
+                    self.update_covered_queries(table, tuple_id, queries, covered_queries)
+
+                
+                # ================= 保持/微调：阶段二 贪心抽样 =================
+                print(f"  [Phase 2] Greedy sampling from {len(partitions)} partitions...")
                 for i, partition in enumerate(partitions):
                     num_covered_before = len(covered_queries)
 
@@ -524,11 +600,11 @@ class Sampler:
             print(f"=== Sampling for table '{table}' completed. Total time: {time_end - time_start:.2f} seconds ===\n")
 
             # 打印出没有覆盖的谓词
-            uncovered_queries = [q for i, q in enumerate(queries) if i not in covered_queries]
-            if uncovered_queries:
-                print(f"Uncovered predicates for table '{table}':")
-                for uq in uncovered_queries:
-                    print(f"  predicate: {uq['predicate_sql']} | original query: {uq['original_text']}")
+            # uncovered_queries = [q for i, q in enumerate(queries) if i not in covered_queries]
+            # if uncovered_queries:
+            #     print(f"Uncovered predicates for table '{table}':")
+            #     for uq in uncovered_queries:
+            #         print(f"  predicate: {uq['predicate_sql']} | original query: {uq['original_text']}")
 
         all_time_end = time.time()
         print(f"All sampling completed. Total time taken: {all_time_end - all_time_start:.2f} seconds.")
@@ -547,10 +623,10 @@ class Sampler:
         print("Database connection closed.")
 
 if __name__ == "__main__":
-    sampler = Sampler("/data2/xuyining/Sampler/single_table/workloads/stats/sampler_config.json")
+    sampler = Sampler("/home/Sampler_CE/single_table/tpch-skew/sampler_config.json")
     try:
         sampler.sample()
-        # sampler.save_samples("/data2/xuyining/Sampler/single_table/workloads/genome/100/samples.json")
+        sampler.save_samples("/home/Sampler_CE/single_table/tpch-skew/samples.json")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
