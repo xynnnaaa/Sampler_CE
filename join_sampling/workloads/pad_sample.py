@@ -101,8 +101,87 @@ class SamplePadder(JoinSampler):
         print(f"        [Warning] Failed to find a valid join path after {max_retries} attempts.")
         return None
 
+    # def _pad_single_file(self, input_json_path: str, output_json_path: str, target_size: int):
+    #     """处理单个 JSON 文件的核心逻辑"""
+    #     try:
+    #         with open(input_json_path, 'r') as f:
+    #             samples_data = json.load(f)
+    #     except Exception as e:
+    #         print(f"        [Error] reading {input_json_path}: {e}")
+    #         return
+
+    #     total_templates = len(samples_data)
+    #     for idx, (template_id, k_bitmaps) in enumerate(samples_data.items()):
+    #         if template_id not in self.join_templates:
+    #             continue
+
+    #         template_data = self.join_templates[template_id]
+    #         self.add_sel_info_to_graph(template_data)
+    #         join_graph = template_data['join_graph']
+    #         aliases = template_data['aliases']
+            
+    #         try:
+    #             join_order_tree, root_table = self.build_join_tree_structure(join_graph, aliases)
+    #         except Exception as e:
+    #             print(f"        [Error] Building join tree failed: {e}")
+    #             continue
+
+    #         for b_idx, bitmap in enumerate(k_bitmaps):
+    #             if not bitmap:
+    #                 sorted_aliases = sorted(aliases)
+    #                 header = [f"{alias}.id" for alias in sorted_aliases]
+    #                 bitmap.append(header)
+    #             else:
+    #                 header = bitmap[0]
+
+    #             current_size = len(bitmap) - 1 
+    #             if current_size >= target_size:
+    #                 print(f"        Template {template_id}... Bitmap {b_idx+1}: Already has {current_size} tuples. Skipping padding.")
+    #                 continue
+
+    #             needed = target_size - current_size
+    #             print(f"        Template {template_id}... Bitmap {b_idx+1}: Found {current_size}. Padding {needed}...")
+
+    #             root_pool = []
+    #             padded_count = 0
+    #             start_time = time.time()
+
+    #             try_cont = 0
+
+    #             while len(bitmap) - 1 < target_size and try_cont < needed * 10:
+    #                 tuple_dict = self.perform_pure_wander_join(join_order_tree, root_table, root_pool)
+    #                 try_cont += 1
+    #                 if tuple_dict:
+    #                     row = [tuple_dict.get(col, None) for col in header]
+    #                     bitmap.append(row)
+    #                     padded_count += 1
+    #                 else:
+    #                     # print(f"            [Warning] Could not find more valid tuples for template {template_id[:10]}... Bitmap {b_idx+1}. Stopping padding.")
+    #                     # break
+    #                     continue
+                
+    #             if len(bitmap) - 1 < target_size:
+    #                 print(f"            [Warning] Only padded {len(bitmap) - 1 - current_size} tuples after {try_cont} attempts.")
+    #             print(f"            -> Padded {padded_count} tuples in {time.time() - start_time:.2f}s.")
+
+    #     def default_serializer(obj):
+    #         import decimal
+    #         import datetime
+    #         if isinstance(obj, (datetime.date, datetime.datetime)):
+    #             return obj.isoformat()
+    #         if isinstance(obj, decimal.Decimal):
+    #             return float(obj)
+    #         return str(obj)
+
+    #     try:
+    #         with open(output_json_path, 'w') as f:
+    #             json.dump(samples_data, f, default=default_serializer, indent=2)
+    #     except Exception as e:
+    #         print(f"        [Error] saving to {output_json_path}: {e}")
+
+
     def _pad_single_file(self, input_json_path: str, output_json_path: str, target_size: int):
-        """处理单个 JSON 文件的核心逻辑"""
+        """处理单个 JSON 文件，每个 template 只保留第一个 bitmap，截断至 50 行，再填充至 target_size"""
         try:
             with open(input_json_path, 'r') as f:
                 samples_data = json.load(f)
@@ -110,60 +189,82 @@ class SamplePadder(JoinSampler):
             print(f"        [Error] reading {input_json_path}: {e}")
             return
 
-        total_templates = len(samples_data)
-        for idx, (template_id, k_bitmaps) in enumerate(samples_data.items()):
+        output_data = {}  # 存放处理后的结果
+
+        for template_id, k_bitmaps in samples_data.items():
             if template_id not in self.join_templates:
+                print(f"    Warning: Template {template_id} not found in parsed join templates, skipped.")
                 continue
 
-            template_data = self.join_templates[template_id]
-            self.add_sel_info_to_graph(template_data)
-            join_graph = template_data['join_graph']
-            aliases = template_data['aliases']
-            
-            try:
-                join_order_tree, root_table = self.build_join_tree_structure(join_graph, aliases)
-            except Exception as e:
-                print(f"        [Error] Building join tree failed: {e}")
+            # ---- 1. 只取第一个 bitmap ----
+            if not k_bitmaps:
                 continue
+            first_bitmap = k_bitmaps[0]
 
-            for b_idx, bitmap in enumerate(k_bitmaps):
-                if not bitmap:
-                    sorted_aliases = sorted(aliases)
-                    header = [f"{alias}.id" for alias in sorted_aliases]
-                    bitmap.append(header)
-                else:
-                    header = bitmap[0]
+            # 确保有 header
+            if not first_bitmap:
+                template_data = self.join_templates[template_id]
+                aliases = template_data['aliases']
+                sorted_aliases = sorted(aliases)
+                header = [f"{alias}.id" for alias in sorted_aliases]
+                first_bitmap = [header]
+            else:
+                header = first_bitmap[0]
 
-                current_size = len(bitmap) - 1 
-                if current_size >= target_size:
-                    print(f"        Template {template_id}... Bitmap {b_idx+1}: Already has {current_size} tuples. Skipping padding.")
+            # ---- 2. 分离出行数据，截断至最多 50 行 ----
+            rows = first_bitmap[1:]          # 不含 header
+            current_size = len(rows)
+            if current_size > 50:
+                rows = rows[:50]             # 只保留前 50 行
+                current_size = 50
+                print(f"        Template {template_id}... Truncated to 50 rows (was {len(rows)})")
+
+            # ---- 3. 准备填充 ----
+            needed = target_size - current_size
+            if needed > 0:
+                print(f"        Template {template_id}... Found {current_size} rows. Padding {needed}...")
+
+                # 构建 join tree
+                template_data = self.join_templates[template_id]
+                self.add_sel_info_to_graph(template_data)
+                join_graph = template_data['join_graph']
+                aliases = template_data['aliases']
+                try:
+                    join_order_tree, root_table = self.build_join_tree_structure(join_graph, aliases)
+                except Exception as e:
+                    print(f"        [Error] Building join tree failed for {template_id}: {e}")
+                    # 无法填充，保留现有行（可能不足 target_size）
+                    final_bitmap = [header] + rows
+                    output_data[template_id] = [final_bitmap]
                     continue
 
-                needed = target_size - current_size
-                print(f"        Template {template_id}... Bitmap {b_idx+1}: Found {current_size}. Padding {needed}...")
-
+                # Wander Join 补全
                 root_pool = []
                 padded_count = 0
                 start_time = time.time()
-
                 try_cont = 0
+                max_attempts = needed * 10
 
-                while len(bitmap) - 1 < target_size and try_cont < needed * 10:
+                while len(rows) < target_size and try_cont < max_attempts:
                     tuple_dict = self.perform_pure_wander_join(join_order_tree, root_table, root_pool)
                     try_cont += 1
                     if tuple_dict:
                         row = [tuple_dict.get(col, None) for col in header]
-                        bitmap.append(row)
+                        rows.append(row)
                         padded_count += 1
-                    else:
-                        # print(f"            [Warning] Could not find more valid tuples for template {template_id[:10]}... Bitmap {b_idx+1}. Stopping padding.")
-                        # break
-                        continue
-                
-                if len(bitmap) - 1 < target_size:
-                    print(f"            [Warning] Only padded {len(bitmap) - 1 - current_size} tuples after {try_cont} attempts.")
+
+                if len(rows) < target_size:
+                    print(f"            [Warning] Only padded {len(rows)-current_size} tuples after {try_cont} attempts.")
                 print(f"            -> Padded {padded_count} tuples in {time.time() - start_time:.2f}s.")
 
+            else:
+                print(f"        Template {template_id}... Already has {current_size} rows (>= target_size). No padding needed.")
+
+            # ---- 4. 组装最终的 bitmap（只保留一个） ----
+            final_bitmap = [header] + rows
+            output_data[template_id] = [final_bitmap]   # 注意外层列表，因为 JSON 结构要求
+
+        # ---- 5. 保存输出 ----
         def default_serializer(obj):
             import decimal
             import datetime
@@ -175,7 +276,7 @@ class SamplePadder(JoinSampler):
 
         try:
             with open(output_json_path, 'w') as f:
-                json.dump(samples_data, f, default=default_serializer, indent=2)
+                json.dump(output_data, f, default=default_serializer, indent=2)
         except Exception as e:
             print(f"        [Error] saving to {output_json_path}: {e}")
 

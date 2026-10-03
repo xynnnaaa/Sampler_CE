@@ -14,6 +14,9 @@ import datetime
 
 import re
 
+
+# update 10.2: 如果新一轮没有覆盖任何谓词，则不再随机选一个元组，直接返回None
+
 def timestamp_to_string(timestamp_str):
     # 将时间戳字符串转换为整数
     unix_timestamp = int(timestamp_str)
@@ -97,7 +100,9 @@ class Sampler:
         self.base_query_dir = self.config["sampling"]["base_query_dir"]
         self.k_bitmaps = self.config["sampling"]["k_bitmaps"]
         self.sample_size = self.config["sampling"]["m_partitions"]
-        self.m_partitions = self.sample_size // 2                   # 贪心算法占一半
+        # self.m_partitions = self.sample_size // 2                   # 贪心算法占一半
+        self.m_partitions = self.sample_size
+
         # self.primary_key = self.get_primary_key()
         self.samples: Dict[str, List[List[Any]]] = defaultdict(list)
         self.query_counter = 0
@@ -362,12 +367,13 @@ class Sampler:
         uncovered_queries_with_indices = [(i, q) for i, q in enumerate(relevant_queries) if i not in covered_queries]
         
         if not uncovered_queries_with_indices:
-            return random.choice(partition_ids)
+            # return random.choice(partition_ids)
+            return None
 
-        # 如果分区内元组太多了，随机选5000个剪枝
+        # 如果分区内元组太多了，随机选2000个剪枝
 
-        if len(partition_ids) > 5000:
-            partition_ids = random.sample(partition_ids, 5000)
+        # if len(partition_ids) > 2000:
+        #     partition_ids = random.sample(partition_ids, 2000)
 
         from collections import Counter
         tuple_scores = Counter()
@@ -410,10 +416,13 @@ class Sampler:
 
         if tuple_scores:
             best_tuple = tuple_scores.most_common(1)[0][0]
-            print(f"    selected tuple covers {tuple_scores[best_tuple]} new queries.")
-            return best_tuple
+            if tuple_scores[best_tuple] > 0:
+                print(f"    selected tuple covers {tuple_scores[best_tuple]} new queries.")
+                return best_tuple
+            else:
+                return None
         else:
-            return random.choice(partition_ids)
+            return None
 
 
     # def update_covered_queries(
@@ -561,18 +570,18 @@ class Sampler:
 
                 current_bitmap = []
 
-                # ================= 新增：阶段一 随机抽样 =================
-                print(f"  [Phase 1] Random sampling {self.m_partitions} tuples...")
-                # 从全表 row_ids 中随机抽样 sample_size // 2 个
-                random_selected = random.sample(row_ids, self.m_partitions) 
-                current_bitmap.extend(random_selected)
+                # # ================= 新增：阶段一 随机抽样 =================
+                # print(f"  [Phase 1] Random sampling {self.m_partitions} tuples...")
+                # # 从全表 row_ids 中随机抽样 sample_size // 2 个
+                # random_selected = random.sample(row_ids, self.m_partitions) 
+                # current_bitmap.extend(random_selected)
 
-                for tuple_id in random_selected:
-                    self.update_covered_queries(table, tuple_id, queries, covered_queries)
+                # for tuple_id in random_selected:
+                #     self.update_covered_queries(table, tuple_id, queries, covered_queries)
 
                 
                 # ================= 保持/微调：阶段二 贪心抽样 =================
-                print(f"  [Phase 2] Greedy sampling from {len(partitions)} partitions...")
+                # print(f"  [Phase 2] Greedy sampling from {len(partitions)} partitions...")
                 for i, partition in enumerate(partitions):
                     num_covered_before = len(covered_queries)
 
@@ -590,7 +599,7 @@ class Sampler:
                         num_covered_after = len(covered_queries)
                         print(f"    Covered queries after selection: {num_covered_after}/{num_total_queries} ({num_covered_after/num_total_queries if num_total_queries > 0 else 0:.1%})")
                     else:
-                        print(f"    Warning: No tuple selected for this partition.")
+                        print(f"    No tuple selected for this partition.")
 
                 self.samples[table].append(current_bitmap)
                 time_end_bitmap = time.time()
@@ -623,10 +632,10 @@ class Sampler:
         print("Database connection closed.")
 
 if __name__ == "__main__":
-    sampler = Sampler("/home/Sampler_CE/single_table/tpch-skew/sampler_config.json")
+    sampler = Sampler("/home/Sampler_CE/single_table/workload_shift/imdb/join_drift/sampler_config.json")
     try:
         sampler.sample()
-        sampler.save_samples("/home/Sampler_CE/single_table/tpch-skew/samples.json")
+        sampler.save_samples("/home/Sampler_CE/single_table/workload_shift/imdb/join_drift/samples.json")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:

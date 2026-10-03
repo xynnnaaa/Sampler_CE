@@ -1355,58 +1355,123 @@ def get_pg_join_order(join_graph, explain):
         print(e)
         pdb.set_trace()
 
-def extract_join_graph(sql):
-    '''
-    @sql: string
-    '''
-    froms,aliases,tables = extract_from_clause(sql)
-    joins = extract_join_clause(sql)
-    join_graph = nx.Graph()
+# def extract_join_graph(sql):
+#     '''
+#     @sql: string
+#     '''
+#     froms,aliases,tables = extract_from_clause(sql)
+#     joins = extract_join_clause(sql)
+#     join_graph = nx.Graph()
 
-    for j in joins:
-        j1 = j.split("=")[0].replace("(", "").replace(")", "")
-        j2 = j.split("=")[1].replace("(", "").replace(")", "")
-        t1 = j1[0:j1.find(".")].strip()
-        t2 = j2[0:j2.find(".")].strip()
-        try:
-            assert t1 in tables or t1 in aliases
-            assert t2 in tables or t2 in aliases
-        except:
-            print(t1, t2)
-            print(tables)
-            print(joins)
-            print("table not in tables!")
-            pdb.set_trace()
+#     for j in joins:
+#         j1 = j.split("=")[0].replace("(", "").replace(")", "")
+#         j2 = j.split("=")[1].replace("(", "").replace(")", "")
+#         t1 = j1[0:j1.find(".")].strip()
+#         t2 = j2[0:j2.find(".")].strip()
+#         try:
+#             assert t1 in tables or t1 in aliases
+#             assert t2 in tables or t2 in aliases
+#         except:
+#             print(t1, t2)
+#             print(tables)
+#             print(joins)
+#             print("table not in tables!")
+#             pdb.set_trace()
 
-        join_graph.add_edge(t1, t2)
-        join_graph[t1][t2]["join_condition"] = j
+#         join_graph.add_edge(t1, t2)
+#         join_graph[t1][t2]["join_condition"] = j
 
-        if t1 in aliases:
-            table1 = aliases[t1]
-            table2 = aliases[t2]
+#         if t1 in aliases:
+#             table1 = aliases[t1]
+#             table2 = aliases[t2]
 
-            join_graph.nodes()[t1]["real_name"] = table1
-            join_graph.nodes()[t2]["real_name"] = table2
+#             join_graph.nodes()[t1]["real_name"] = table1
+#             join_graph.nodes()[t2]["real_name"] = table2
 
-    parsed = sqlparse.parse(sql)[0]
-    # let us go over all the where clauses
-    where_clauses = None
-    for token in parsed.tokens:
-        if (type(token) == sqlparse.sql.Where):
-            where_clauses = token
-    assert where_clauses is not None
+#     parsed = sqlparse.parse(sql)[0]
+#     # let us go over all the where clauses
+#     where_clauses = None
+#     for token in parsed.tokens:
+#         if (type(token) == sqlparse.sql.Where):
+#             where_clauses = token
+#     assert where_clauses is not None
 
-    if len(join_graph.nodes()) == 0:
-        for alias in aliases:
-            join_graph.add_node(alias)
-            join_graph.nodes()[alias]["real_name"] = aliases[alias]
+#     if len(join_graph.nodes()) == 0:
+#         for alias in aliases:
+#             join_graph.add_node(alias)
+#             join_graph.nodes()[alias]["real_name"] = aliases[alias]
 
-    for t1 in join_graph.nodes():
-        tables = [t1]
-        matches = find_all_clauses(tables, where_clauses)
-        join_graph.nodes()[t1]["predicates"] = matches
+#     for t1 in join_graph.nodes():
+#         tables = [t1]
+#         matches = find_all_clauses(tables, where_clauses)
+#         join_graph.nodes()[t1]["predicates"] = matches
 
-    return join_graph
+#     return join_graph
+
+
+def extract_join_graph(sql_str):
+    """
+    使用 sqlglot 完美重写的 extract_join_graph
+    全面兼容 TPC-H (_key) 和 IMDB (_id)，彻底抛弃脆弱的 sqlparse 和硬编码过滤
+    """
+    import networkx as nx
+    import sqlglot
+    from sqlglot import exp
+
+    # 核心安全操作：全转小写。防止下游采样器在执行 re.sub(r"\b{alias}\.", ...) 时因大小写不匹配而失效
+    sql_str = sql_str.lower()
+    parsed = sqlglot.parse_one(sql_str)
+    g = nx.Graph()
+
+    # 1. 提取所有表和别名（添加为图的顶点）
+    for table in parsed.find_all(exp.Table):
+        alias = table.alias_or_name
+        real_name = table.name
+        # 兼容下游：初始化 real_name 和 predicates 列表
+        g.add_node(alias, real_name=real_name, predicates=[])
+
+    # 如果没有解析到表，直接返回空图
+    if len(g.nodes) == 0:
+        return g
+
+    # 2. 解析 WHERE 子句
+    where_clause = parsed.find(exp.Where)
+    if where_clause:
+        # A. 提取跨表的等值连接条件（添加为图的边）
+        for eq in where_clause.find_all(exp.EQ):
+            left_col = eq.left.find(exp.Column)
+            right_col = eq.right.find(exp.Column)
+
+            if left_col and right_col:
+                l_table = left_col.table
+                r_table = right_col.table
+
+                # 只要是跨两个不同实体的等值关联，就是合法的 Join 边
+                if l_table and r_table and l_table != r_table:
+                    if l_table in g.nodes and r_table in g.nodes:
+                        # 还原为原脚本期望的字符串格式: "tpch_ps.ps_suppkey = tpch_s.s_suppkey"
+                        cond_str = f"{l_table}.{left_col.name} = {r_table}.{right_col.name}"
+                        g.add_edge(l_table, r_table, join_condition=cond_str)
+                        continue # 作为 Join 条件处理后，不纳入单表本地谓词
+
+        # B. 收集每张表独立的本地过滤谓词（塞入顶点的 predicates 中）
+        supported_ops = (exp.EQ, exp.GT, exp.LT, exp.GTE, exp.LTE, exp.NEQ, exp.In, exp.Like)
+        for condition in where_clause.find_all(supported_ops):
+            cols = condition.find_all(exp.Column)
+            involved_tables = {c.table for c in cols if c.table}
+
+            # 如果该过滤条件仅涉及一张表，说明它是该表的本地过滤条件
+            if len(involved_tables) == 1:
+                t = list(involved_tables)[0]
+                if t in g.nodes:
+                    # 获取该条件的 SQL 文本（例如: "tpch_ps.ps_supplycost > 100"）
+                    pred_sql = condition.sql()
+                    if pred_sql not in g.nodes[t]["predicates"]:
+                        g.nodes[t]["predicates"].append(pred_sql)
+
+    return g
+
+
 
 def extract_values(obj, key):
     """Recursively pull values of specified key from nested JSON."""

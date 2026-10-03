@@ -308,21 +308,21 @@ class JoinSampler:
             print(f"Error loading {self.sql_file}: {e}")
             return
 
-        try:
-            with open("/home/PRICE/datas/tpch/train.sql", 'r') as f:
-                lines_1 = f.readlines()
-        except Exception as e:
-            print(f"Error loading {self.sql_file}: {e}")
-            return
+        # try:
+        #     with open("/home/PRICE/datas/tpch/train.sql", 'r') as f:
+        #         lines_1 = f.readlines()
+        # except Exception as e:
+        #     print(f"Error loading {self.sql_file}: {e}")
+        #     return
         
-        try:
-            with open("/home/PRICE/datas/tpch/test_sub.sql", 'r') as f:
-                lines_2 = f.readlines()
-        except Exception as e:
-            print(f"Error loading {self.sql_file}: {e}")
-            return
+        # try:
+        #     with open("/home/PRICE/datas/tpch/test_sub.sql", 'r') as f:
+        #         lines_2 = f.readlines()
+        # except Exception as e:
+        #     print(f"Error loading {self.sql_file}: {e}")
+        #     return
         
-        lines = lines_1 + lines_2
+        # lines = lines_1 + lines_2
         
         for line_idx, line in enumerate(lines):
             line = line.strip()
@@ -710,123 +710,248 @@ class JoinSampler:
         except Exception as e:
             print(f"Error partitioning root table '{real_name}': {e}")
             raise e
+        
 
     def create_annotation_tables(self):
         """
-        [One-Time Setup]
-        不修改原表，而是创建 '{table}_anno_idx' 伴生表存储 PID Bitmap。
-        表结构: (id PRIMARY KEY, anno BIT VARYING)
+        [One-Time Setup - Ultimate Optimized]
+        使用 1-Pass + 字符串拼接 (||) 替代按位或 (|)。
+        极大降低 CPU 计算和内存分配开销。
         """
-        print(f"    [Sidecar Setup] Creating annotation tables...")
+        print(f"[Sidecar Setup] Creating annotation tables (Ultimate Optimized)...")
 
-        ROW_BATCH_SIZE = 100000
-        UNIQUE_PRED_BATCH_SIZE = 1000
+        # 调大 Batch Size，拼接操作对 AST 的压力比 OR 操作小得多
+        UNIQUE_PRED_BATCH_SIZE = 1000 
+        
+        #[配置并行度] 获取你服务器的逻辑核心数，尽量拉满
+        import multiprocessing
+        cpu_cores = multiprocessing.cpu_count()
+        # 留 2-4 个核心给操作系统和其他进程，最多用到 16 或 32
+        parallel_workers = 32
+        print(f"        [System] Setting parallel workers to {parallel_workers}")
 
         start_total = time.time()
         for real_name in self.all_involved_tables:
-            if self.workload_name:
-                sidecar_name = f"{real_name}_anno_idx_{self.workload_name}"
-            else:
-                sidecar_name = f"{real_name}_anno_idx"
+            sidecar_name = f"{real_name}_anno_idx_{self.workload_name}" if self.workload_name else f"{real_name}_anno_idx"
             print(f"        Processing '{real_name}' -> '{sidecar_name}'...", flush=True)
+            
             preds_dict = self.global_predicate_map.get(real_name, {})
-            total_preds = len(preds_dict)
-            if total_preds == 0:
-                total_preds = 1  # 至少要有一位，避免 SQL 错误
-            zero_string = '0' * total_preds
+            total_preds = max(len(preds_dict), 1)
 
             try:
                 self.cursor.execute(f"SELECT to_regclass('{sidecar_name}');")
                 if self.cursor.fetchone()[0] is not None:
-                    print(f"        Skipping '{real_name}': Sidecar '{sidecar_name}' already exists.", flush=True)
+                    print(f"        Skipping '{real_name}': Sidecar already exists.", flush=True)
                     continue
 
                 self.cursor.execute(f"DROP TABLE IF EXISTS {sidecar_name}")
                 self.conn.commit()
 
-                create_sql = f"""
-                    CREATE TABLE {sidecar_name} AS
-                    SELECT id AS query_anno_id, B'{zero_string}'::{f"BIT VARYING({total_preds})"} AS query_anno
-                    FROM {real_name}
-                """
-                self.cursor.execute(create_sql)
+                if not preds_dict:
+                    zero_string = '0' * total_preds
+                    create_sql = f"""
+                        CREATE TABLE {sidecar_name} AS
+                        SELECT id AS query_anno_id, B'{zero_string}'::{f"BIT VARYING({total_preds})"} AS query_anno
+                        FROM {real_name}
+                    """
+                    self.cursor.execute(create_sql)
+                else:
+                    # 1. 将字典按 pid 排序，确保拼接的顺序和 bitmap 索引绝对一致
+                    # 建立一个按 pid 顺序排列的谓词列表
+                    ordered_preds = [None] * total_preds
+                    for pred_sql, pid in preds_dict.items():
+                        ordered_preds[pid] = pred_sql
+                    
+                    chunk_selects =[]
+                    
+                    # 2. 分块生成拼接 SQL
+                    for i in range(0, total_preds, UNIQUE_PRED_BATCH_SIZE):
+                        batch_preds = ordered_preds[i : i + UNIQUE_PRED_BATCH_SIZE]
+                        expr_parts =[]
+                        
+                        for pred_sql in batch_preds:
+                            if pred_sql is None:
+                                # 理论上 pid 是连续分配的不会有空，防御性编程
+                                expr_parts.append("B'0'") 
+                            else:
+                                # [核心优化] 每次只产生 1 位，B'1' 或 B'0'
+                                expr = f"(CASE WHEN {pred_sql} THEN B'1' ELSE B'0' END)"
+                                expr_parts.append(expr)
+                        
+                        # [核心优化] 使用 || 进行字符串拼接
+                        chunk_expr = " || ".join(expr_parts)
+                        chunk_selects.append(f"({chunk_expr}) AS chunk_{i//UNIQUE_PRED_BATCH_SIZE}")
+
+                    # 3. 组合终极 SQL
+                    if len(chunk_selects) == 1:
+                        final_expr = chunk_selects[0].split(" AS ")[0]
+                        create_sql = f"""
+                            CREATE TABLE {sidecar_name} AS
+                            SELECT id AS query_anno_id, 
+                                   ({final_expr})::BIT VARYING({total_preds}) AS query_anno
+                            FROM {real_name}
+                        """
+                    else:
+                        # 外层再把各个 chunk 拼起来
+                        inner_select_cols = ",\n                           ".join(chunk_selects)
+                        chunk_names =[f"chunk_{i//UNIQUE_PRED_BATCH_SIZE}" for i in range(0, total_preds, UNIQUE_PRED_BATCH_SIZE)]
+                        final_anno_expr = " || ".join(chunk_names)
+                        
+                        create_sql = f"""
+                            CREATE TABLE {sidecar_name} AS
+                            SELECT query_anno_id,
+                                   ({final_anno_expr})::BIT VARYING({total_preds}) AS query_anno
+                            FROM (
+                                SELECT id AS query_anno_id,
+                                       {inner_select_cols}
+                                FROM {real_name}
+                            ) tmp
+                        """
+
+                    t0 = time.time()
+                    print(f"            Executing Ultimate 1-Pass CREATE TABLE AS SELECT...")
+                    
+                    #[火力全开] 设置高并发度和高工作内存
+                    self.cursor.execute(f"SET max_parallel_workers_per_gather = {parallel_workers};")
+                    self.cursor.execute("SET work_mem = '1GB';") 
+                    
+                    self.cursor.execute(create_sql)
+                    print(f"            Created and populated in {time.time() - t0:.2f}s")
+
+                print(f"            Building Primary Key...")
                 self.cursor.execute(f"ALTER TABLE {sidecar_name} ADD PRIMARY KEY (query_anno_id)")
                 self.conn.commit()
 
-                self.cursor.execute(f"SELECT min(id), max(id) FROM {real_name}")
-                min_id, max_id = self.cursor.fetchone()
-                if min_id is None: min_id = 0
-                if max_id is None: max_id = 0
-                
-                total_row_batches = (max_id - min_id) // ROW_BATCH_SIZE + 1
-
-                if not preds_dict:
-                    print(f"            No predicates for table '{real_name}'. Created anno column with default zeros.")
-                    continue
-
-                sorted_items = sorted(preds_dict.items(), key=lambda x: x[1])
-                sql_chunks = []
-                for i in range(0, total_preds, UNIQUE_PRED_BATCH_SIZE):
-                    batch_items = sorted_items[i : i + UNIQUE_PRED_BATCH_SIZE]
-                    expr_parts = []
-                    where_conditions = []
-
-                    for pred_sql, pid in batch_items:
-                        where_conditions.append(pred_sql)
-
-                        mask_list = ['0'] * total_preds
-                        mask_list[pid] = '1'
-                        current_mask_str = "".join(mask_list)
-
-                        expr = f"(CASE WHEN {pred_sql} THEN B'{current_mask_str}' ELSE B'{zero_string}' END)"
-                        expr_parts.append(expr)
-                    
-                    pred_where = f"({' OR '.join(where_conditions)})" if where_conditions else ""
-                    full_expr = " | ".join(expr_parts)
-                    sql_chunks.append((full_expr, pred_where))
-
-                # 外层循环：遍历 ID 范围
-                current_id = min_id
-                row_batch_count = 0
-
-                while current_id <= max_id:
-                    next_id = current_id + ROW_BATCH_SIZE
-                    row_batch_count += 1
-                    t0 = time.time()
-
-                    for full_expr, pred_where in sql_chunks:
-                        update_sql = f"""
-                            UPDATE {sidecar_name} s
-                            SET query_anno = query_anno | ({full_expr})
-                            FROM {real_name} o
-                            WHERE s.query_anno_id = o.id
-                                AND s.query_anno_id >= {current_id} AND s.query_anno_id < {next_id}
-                                {"AND " + pred_where if pred_where else ""}
-                        """
-                        self.cursor.execute(update_sql)
-                    
-                    self.conn.commit()
-
-                    if row_batch_count % 10 == 1 or row_batch_count == total_row_batches:
-                        print(f"            Processed row batch {row_batch_count}/{total_row_batches} (IDs [{current_id}, {next_id})). Time: {time.time() - t0:.2f}s")
-
-                    current_id = next_id
-
-                self.conn.commit()
-
                 old_isolation_level = self.conn.isolation_level
-                self.conn.set_isolation_level(0)  # 设置为 autocommit 模式
+                self.conn.set_isolation_level(0)
                 try:
                     self.cursor.execute(f"VACUUM ANALYZE {sidecar_name};")
                 finally:
-                    self.conn.set_isolation_level(old_isolation_level)  # 恢复原始隔离级别
+                    self.conn.set_isolation_level(old_isolation_level)
 
             except Exception as e:
-                print(f"Error creating annotation table to table '{real_name}': {e}")
+                print(f"Error creating annotation table for '{real_name}': {e}")
                 self.conn.rollback()
                 raise e
             
         print(f"    [Sidecar Setup] Finished. Total time: {time.time() - start_total:.2f}s", flush=True)
+
+    # def create_annotation_tables(self):
+    #     """
+    #     [One-Time Setup]
+    #     不修改原表，而是创建 '{table}_anno_idx' 伴生表存储 PID Bitmap。
+    #     表结构: (id PRIMARY KEY, anno BIT VARYING)
+    #     """
+    #     print(f"    [Sidecar Setup] Creating annotation tables...")
+
+    #     ROW_BATCH_SIZE = 100000
+    #     UNIQUE_PRED_BATCH_SIZE = 1000
+
+    #     start_total = time.time()
+    #     for real_name in self.all_involved_tables:
+    #         if self.workload_name:
+    #             sidecar_name = f"{real_name}_anno_idx_{self.workload_name}"
+    #         else:
+    #             sidecar_name = f"{real_name}_anno_idx"
+    #         print(f"        Processing '{real_name}' -> '{sidecar_name}'...", flush=True)
+    #         preds_dict = self.global_predicate_map.get(real_name, {})
+    #         total_preds = len(preds_dict)
+    #         if total_preds == 0:
+    #             total_preds = 1  # 至少要有一位，避免 SQL 错误
+    #         zero_string = '0' * total_preds
+
+    #         try:
+    #             self.cursor.execute(f"SELECT to_regclass('{sidecar_name}');")
+    #             if self.cursor.fetchone()[0] is not None:
+    #                 print(f"        Skipping '{real_name}': Sidecar '{sidecar_name}' already exists.", flush=True)
+    #                 continue
+
+    #             self.cursor.execute(f"DROP TABLE IF EXISTS {sidecar_name}")
+    #             self.conn.commit()
+
+    #             create_sql = f"""
+    #                 CREATE TABLE {sidecar_name} AS
+    #                 SELECT id AS query_anno_id, B'{zero_string}'::{f"BIT VARYING({total_preds})"} AS query_anno
+    #                 FROM {real_name}
+    #             """
+    #             self.cursor.execute(create_sql)
+    #             self.cursor.execute(f"ALTER TABLE {sidecar_name} ADD PRIMARY KEY (query_anno_id)")
+    #             self.conn.commit()
+
+    #             self.cursor.execute(f"SELECT min(id), max(id) FROM {real_name}")
+    #             min_id, max_id = self.cursor.fetchone()
+    #             if min_id is None: min_id = 0
+    #             if max_id is None: max_id = 0
+                
+    #             total_row_batches = (max_id - min_id) // ROW_BATCH_SIZE + 1
+
+    #             if not preds_dict:
+    #                 print(f"            No predicates for table '{real_name}'. Created anno column with default zeros.")
+    #                 continue
+
+    #             sorted_items = sorted(preds_dict.items(), key=lambda x: x[1])
+    #             sql_chunks = []
+    #             for i in range(0, total_preds, UNIQUE_PRED_BATCH_SIZE):
+    #                 batch_items = sorted_items[i : i + UNIQUE_PRED_BATCH_SIZE]
+    #                 expr_parts = []
+    #                 where_conditions = []
+
+    #                 for pred_sql, pid in batch_items:
+    #                     where_conditions.append(pred_sql)
+
+    #                     mask_list = ['0'] * total_preds
+    #                     mask_list[pid] = '1'
+    #                     current_mask_str = "".join(mask_list)
+
+    #                     expr = f"(CASE WHEN {pred_sql} THEN B'{current_mask_str}' ELSE B'{zero_string}' END)"
+    #                     expr_parts.append(expr)
+                    
+    #                 pred_where = f"({' OR '.join(where_conditions)})" if where_conditions else ""
+    #                 full_expr = " | ".join(expr_parts)
+    #                 sql_chunks.append((full_expr, pred_where))
+
+    #             # 外层循环：遍历 ID 范围
+    #             current_id = min_id
+    #             row_batch_count = 0
+
+    #             while current_id <= max_id:
+    #                 next_id = current_id + ROW_BATCH_SIZE
+    #                 row_batch_count += 1
+    #                 t0 = time.time()
+
+    #                 for full_expr, pred_where in sql_chunks:
+    #                     update_sql = f"""
+    #                         UPDATE {sidecar_name} s
+    #                         SET query_anno = query_anno | ({full_expr})
+    #                         FROM {real_name} o
+    #                         WHERE s.query_anno_id = o.id
+    #                             AND s.query_anno_id >= {current_id} AND s.query_anno_id < {next_id}
+    #                             {"AND " + pred_where if pred_where else ""}
+    #                     """
+    #                     self.cursor.execute(update_sql)
+                    
+    #                 self.conn.commit()
+
+    #                 if row_batch_count % 10 == 1 or row_batch_count == total_row_batches:
+    #                     print(f"            Processed row batch {row_batch_count}/{total_row_batches} (IDs [{current_id}, {next_id})). Time: {time.time() - t0:.2f}s")
+
+    #                 current_id = next_id
+
+    #             self.conn.commit()
+
+    #             old_isolation_level = self.conn.isolation_level
+    #             self.conn.set_isolation_level(0)  # 设置为 autocommit 模式
+    #             try:
+    #                 self.cursor.execute(f"VACUUM ANALYZE {sidecar_name};")
+    #             finally:
+    #                 self.conn.set_isolation_level(old_isolation_level)  # 恢复原始隔离级别
+
+    #         except Exception as e:
+    #             print(f"Error creating annotation table to table '{real_name}': {e}")
+    #             self.conn.rollback()
+    #             raise e
+            
+    #     print(f"    [Sidecar Setup] Finished. Total time: {time.time() - start_total:.2f}s", flush=True)
 
     def greedy_join_selection(self, partition_ids, partition_idx, root_table, join_tree, template_data, global_covered_mask, limit_x):
         """
@@ -1133,7 +1258,7 @@ class JoinSampler:
         start_time = time.time()
         self.load_and_parse_workload() 
         print(f"Total Join Templates Loaded: {len(self.join_templates)}, Workload Parsing Time: {time.time() - start_time:.2f}s")
-        # self.create_annotation_tables()
+        self.create_annotation_tables()
         # if not self.join_templates:
         #     print("No join templates found. Exiting.")
         #     return

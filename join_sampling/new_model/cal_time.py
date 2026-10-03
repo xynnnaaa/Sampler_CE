@@ -39,7 +39,7 @@ def extract_times(log_file_path):
 
 def main():
     # 目标目录（可修改为实际路径）
-    base_dir = '/home/Sampler_CE/join_sampling/new_model/linear/ergastf1/runfile'
+    base_dir = '/home/Sampler_CE/join_sampling/new_model/linear_new/stats/100/runfile'
     log_files = glob.glob(os.path.join(base_dir, '*.log'))
 
     if not log_files:

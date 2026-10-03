@@ -150,6 +150,17 @@ TABLE_CARD_GENOME = {
     "pred_classes": 150,
 }
 
+TABLE_CARD_TPCH = {
+    "lineitem": 59989262,
+    "orders": 15002488,
+    "partsupp": 7997634,
+    "part": 2000143,
+    "customer": 1500258,
+    "supplier": 100000,
+    "nation": 25,
+    "region": 5,
+}
+
 
 
 # ================= 数据结构: Trie 树 =================
@@ -377,6 +388,8 @@ class JoinSampler:
                 card = TABLE_CARD_ERGASTF1.get(real_name.lower(), float("inf"))
             elif "genome" in self.db_config.get("dbname", "").lower():
                 card = TABLE_CARD_GENOME.get(real_name.lower(), float("inf"))
+            elif "tpch" in self.db_config.get("dbname", "").lower():
+                card = TABLE_CARD_TPCH.get(real_name.lower(), float("inf"))
             else:
                 print(f"Warning: Unknown database '{self.db_config.get('dbname', '')}', defaulting cardinality to infinity.")
                 card = float("inf")
@@ -414,6 +427,8 @@ class JoinSampler:
                             card = TABLE_CARD_ERGASTF1.get(real_name.lower(), float("inf"))
                         elif "genome" in self.db_config.get("dbname", "").lower():
                             card = TABLE_CARD_GENOME.get(real_name.lower(), float("inf"))
+                        elif "tpch" in self.db_config.get("dbname", "").lower():
+                            card = TABLE_CARD_TPCH.get(real_name.lower(), float("inf"))
                         else:
                             print(f"Warning: Unknown database '{self.db_config.get('dbname', '')}', defaulting cardinality to infinity.")
                             card = float("inf")
@@ -839,31 +854,31 @@ class JoinSampler:
 
         print(f"Parsed templates across all queries in {time.time() - t_start:.2f}s.")
 
-        if not self.temp_template_data:
-            print("No templates parsed. Exiting.")
-            return
+        # if not self.temp_template_data:
+        #     print("No templates parsed. Exiting.")
+        #     return
 
-        cur_output_path = os.path.join(self.output_path, str(worker_id))
-        if not os.path.exists(cur_output_path):
-            os.makedirs(cur_output_path)
+        # cur_output_path = os.path.join(self.output_path, str(worker_id))
+        # if not os.path.exists(cur_output_path):
+        #     os.makedirs(cur_output_path)
 
-        # 任务分配
-        all_items = list(self.temp_template_data.items())
-        all_items.sort(key=lambda x: x[0][1]) # 按签名排序确保稳定
-        my_tasks =[item for i, item in enumerate(all_items) if i % num_workers == worker_id]
+        # # 任务分配
+        # all_items = list(self.temp_template_data.items())
+        # all_items.sort(key=lambda x: x[0][1]) # 按签名排序确保稳定
+        # my_tasks =[item for i, item in enumerate(all_items) if i % num_workers == worker_id]
         
-        print(f"Worker {worker_id} assigned {len(my_tasks)} templates.")
-        if not my_tasks: return
+        # print(f"Worker {worker_id} assigned {len(my_tasks)} templates.")
+        # if not my_tasks: return
 
-        # 构建局部 Trie 树
-        self.build_global_trie_for_tasks(my_tasks)
+        # # 构建局部 Trie 树
+        # self.build_global_trie_for_tasks(my_tasks)
 
-        # 逐个 Root 处理并保存
-        for batch_index, (root_token, root_node) in enumerate(self.trie.root.children.items()):
-            print(f"\n=== Processing Trie Root: {root_node.child_alias} ({root_node.real_name}) ===")
-            self.sample_trie_root(root_node, cur_output_path, batch_index)
+        # # 逐个 Root 处理并保存
+        # for batch_index, (root_token, root_node) in enumerate(self.trie.root.children.items()):
+        #     print(f"\n=== Processing Trie Root: {root_node.child_alias} ({root_node.real_name}) ===")
+        #     self.sample_trie_root(root_node, cur_output_path, batch_index)
             
-        print(f"Worker {worker_id} finished in {time.time() - t_start:.2f}s")
+        # print(f"Worker {worker_id} finished in {time.time() - t_start:.2f}s")
 
 if __name__ == "__main__":
     if len(sys.argv) != 4:

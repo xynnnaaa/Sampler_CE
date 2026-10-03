@@ -145,6 +145,19 @@ TABLE_CARD_GENOME = {
     "pred_classes": 150,
 }
 
+TABLE_CARD_TPCH = {
+    "lineitem": 59989262,
+    "orders": 15002488,
+    "partsupp": 7997634,
+    "part": 2000143,
+    "customer": 1500258,
+    "supplier": 100000,
+    "nation": 25,
+    "region": 5,
+}
+
+
+
 
 # ================= 主类: JoinSampler (Baseline 线性版) =================
 
@@ -190,6 +203,8 @@ class JoinSampler:
         self.engine = WanderJoinEngine(self.conn, self.cursor)
         self.all_involved_tables = set()
 
+        self.worker_id = 0
+
     def close(self):
         if self.cursor: self.cursor.close()
         if self.conn: self.conn.close()
@@ -216,6 +231,7 @@ class JoinSampler:
                 sql_str = remove_unnecessary_parentheses(sql_str)
                 join_graph = extract_join_graph(sql_str)
             except Exception as e:
+                print(f"Error parsing SQL on line {line_idx+1}: {e}")
                 continue
 
             sorted_aliases = sorted(list(join_graph.nodes()))
@@ -267,6 +283,8 @@ class JoinSampler:
             
             self.temp_template_data[template_key]['instances'].append(current_query_pids)
 
+        # print(f"Worker {worker_id} parsed {len(self.temp_template_data)} unique templates.")
+
     def add_sel_info_to_graph(self, join_graph):
         for node, info in join_graph.nodes(data=True):
             sels =[]
@@ -300,6 +318,8 @@ class JoinSampler:
                 card = TABLE_CARD_ERGASTF1.get(real_name.lower(), float("inf"))
             elif "genome" in self.db_config.get("dbname", "").lower():
                 card = TABLE_CARD_GENOME.get(real_name.lower(), float("inf"))
+            elif "tpch" in self.db_config.get("dbname", "").lower():
+                card = TABLE_CARD_TPCH.get(real_name.lower(), float("inf"))
             else:
                 print(f"Warning: Unknown database '{self.db_config.get('dbname', '')}', defaulting cardinality to infinity.")
                 card = float("inf")
@@ -337,6 +357,8 @@ class JoinSampler:
                             card = TABLE_CARD_ERGASTF1.get(real_name.lower(), float("inf"))
                         elif "genome" in self.db_config.get("dbname", "").lower():
                             card = TABLE_CARD_GENOME.get(real_name.lower(), float("inf"))
+                        elif "tpch" in self.db_config.get("dbname", "").lower():
+                            card = TABLE_CARD_TPCH.get(real_name.lower(), float("inf"))
                         else:
                             print(f"Warning: Unknown database '{self.db_config.get('dbname', '')}', defaulting cardinality to infinity.")
                             card = float("inf")
@@ -392,148 +414,52 @@ class JoinSampler:
                     
         return pid_map, global_map, total_queries
 
+    def _random_walk_single(self, root_id, join_execution_plan):
+        """
+        基于单个 root_id 尝试一次完整的随机 Wander Join。
+        成功返回整条 tuple 字典，失败返回 None。
+        """
+        root_step = join_execution_plan[0]
+        root_real = root_step['real_name']
+        root_alias = root_step['alias']
+        root_sels = root_step['sels']
 
-    # ================= 核心独立执行逻辑 =================
+        # 获取 Root 元组
+        neighbors, _ = self.engine._batch_fetch_neighbors(
+            root_real, "id", [root_id], root_sels, root_alias
+        )
+        if not neighbors or str(root_id) not in neighbors or not neighbors[str(root_id)]:
+            return None
 
-    # def sample_for_one_template(self, template_id, template_data):
-    #     """
-    #     对单个 Template 执行 Monte Carlo Random Walk。
-    #     严格不使用缓存和树结构。
-    #     """
+        current_tuple = neighbors[str(root_id)][0].copy()
 
-    #     self.engine.bitmap_cache.clear()
+        for step in join_execution_plan[1:]:
+            alias = step['alias']
+            real_name = step['real_name']
+            parent_alias = step['parent']
+            raw_cond = step['join_condition']
+            sel_cols = step.get('sels', [])
 
-        
-    #     join_graph = template_data['graph']
-    #     self.add_sel_info_to_graph(join_graph)
-    #     aliases = list(template_id[0])
-    #     instances = template_data['instances']
-        
-    #     join_execution_plan = self.build_join_tree_structure(join_graph, aliases)
-    #     root_info = join_execution_plan[0]
-        
-    #     partitions = self.partition_root_table(root_info['real_name'], self.m_partitions)
-    #     pid_map, global_map, total_qids = self.prepare_template_pid_map(instances)
-        
-    #     target_full_mask = (1 << total_qids) - 1
-    #     template_covered_mask = 0
-        
-    #     all_k_samples = []
+            my_col, parent_col = self.engine._parse_cond(raw_cond, alias, parent_alias)
+            if not my_col:
+                return None
 
-    #     for k_idx in range(self.k_bitmaps):
-    #         print(f"    --> Bitmap {k_idx+1}/{self.k_bitmaps}...", flush=True)
-            
-    #         current_bitmap_samples = []
+            parent_key = f"{parent_alias}.{parent_col}"
+            parent_val = current_tuple.get(parent_key)
+            if parent_val is None:
+                return None
 
-    #         for p_idx, partition_ids in enumerate(partitions):
-    #             if not partition_ids: continue
-                
-    #             t_p = time.time()
-                
-    #             # 1. 剪枝检查：看当前还缺多少覆盖
-    #             uncovered_mask_int = target_full_mask & ~template_covered_mask
-    #             if uncovered_mask_int == 0:
-    #                 break
+            next_neighbors, _ = self.engine._batch_fetch_neighbors(
+                real_name, my_col, [parent_val], sel_cols, alias
+            )
+            candidates = next_neighbors.get(str(parent_val), [])
+            if not candidates:
+                return None
 
-    #             # 2. Root 抓取
-    #             neighbors, _ = self.engine._batch_fetch_neighbors(
-    #                 root_info['real_name'], "id", partition_ids, root_info['sels'], root_info['alias']
-    #             )
+            chosen = random.choice(candidates)
+            current_tuple.update(chosen)
 
-    #             translated_map, _ = self.engine._batch_fetch_translate_bitmaps(
-    #                 root_info['real_name'], partition_ids,
-    #                 workload_name=self.workload_name, alias=root_info['alias'],
-    #                 pid_map=pid_map.get(root_info['alias'], {}),
-    #                 global_map=global_map.get(root_info['alias'], 0)
-    #             )
-
-    #             # 3. 构建初始平行路径
-    #             active_paths = []
-    #             for pid in set(partition_ids):
-    #                 p_val = str(pid)
-    #                 rows = neighbors.get(p_val, [])
-    #                 if not rows: continue
-                    
-    #                 row_data = rows[0]
-    #                 qid_mask = translated_map.get(p_val, global_map.get(root_info['alias'], 0))
-                    
-    #                 # [极速剪枝]
-    #                 if (qid_mask & uncovered_mask_int) == 0:
-    #                     continue
-                        
-    #                 clean_data = {k: v for k, v in row_data.items() if k != '_bmp_str'}
-
-    #                 # Monte Carlo 裂变 w 次
-    #                 for _ in range(self.w_samples):
-    #                     active_paths.append({
-    #                         'vals': clean_data.copy(),
-    #                         'acc_bmp': qid_mask,
-    #                         'alive': True
-    #                     })
-
-    #             if not active_paths:
-    #                 continue
-
-    #             # 4. 线性向下走 (Wander Join 直到模板末尾)
-    #             for step in join_execution_plan[1:]:
-    #                 step_info = {
-    #                     'alias': step['alias'],
-    #                     'real_name': step['real_name'],
-    #                     'parent': step['parent'],
-    #                     'join_condition': step['join_condition'],
-    #                     'sels': step['sels']
-    #                 }
-                    
-    #                 active_paths = self.engine.extend_paths_one_step(
-    #                     active_paths, step_info, pid_map, global_map, self.workload_name
-    #                 )
-                    
-    #                 if not active_paths:
-    #                     break 
-                
-    #             # 5. 打分挑最好
-    #             if not active_paths:
-    #                 continue
-
-    #             best_path = None
-    #             best_score = -1
-    #             best_new_cov = 0
-                
-    #             for path in active_paths:
-    #                 anno_bits = path['acc_bmp']
-    #                 score = bin(anno_bits & uncovered_mask_int).count('1')
-    #                 if score > best_score:
-    #                     best_score = score
-    #                     best_path = path
-    #                     best_new_cov = anno_bits & uncovered_mask_int
-                        
-    #             if not best_path:
-    #                 best_path = active_paths[0]
-                    
-    #             # 提取最佳结果
-    #             sample_dict = {}
-    #             for k, v in best_path['vals'].items():
-    #                 if k.endswith(".id") or k.endswith(".Id"):
-    #                     alias = k.split('.')[0]
-    #                     sample_dict[alias] = v
-                
-    #             current_bitmap_samples.append(sample_dict)
-    #             template_covered_mask |= best_new_cov
-                
-    #             cov_count = bin(template_covered_mask).count('1')
-    #             print(f"        Partition {p_idx+1}/{len(partitions)} done in {time.time()-t_p:.2f}s. Coverage: {cov_count}/{total_qids}")
-
-    #             if bin(template_covered_mask).count('1') / total_qids >= 0.99:
-    #                 print(f"        Coverage reached 99% after partition {p_idx+1}. Stop sampling partitions.")
-    #                 break
-
-    #         all_k_samples.append(current_bitmap_samples)
-            
-    #         if bin(template_covered_mask).count('1') / total_qids >= 0.99:
-    #             print(f"        Coverage reached 99%. Stop sampling further bitmaps.")
-    #             break
-                
-    #     return all_k_samples
+        return current_tuple
 
 
     def sample_for_one_template(self, template_id, template_data):
@@ -563,19 +489,52 @@ class JoinSampler:
         
         all_k_samples = []
 
+        num_partitions = len(partitions)
+
+        half = num_partitions // 2 
+
+        # half = 0
+
         for k_idx in range(self.k_bitmaps):
             print(f"    --> Bitmap {k_idx+1}/{self.k_bitmaps}...", flush=True)
             current_bitmap_samples = []
 
+            force_random = False  # 是否强制随机采样
+
             for p_idx, partition_ids in enumerate(partitions):
                 if not partition_ids: continue
+
+                # 判断当前分区是否应使用随机采样
+                use_random = force_random or (p_idx >= half)
+
+                if use_random:
+                    sampled = False
+                    for pid in partition_ids:
+                        walk_tuple = self._random_walk_single(pid, join_execution_plan)
+
+                        if walk_tuple is not None:
+                            # 提取样本（与原提取逻辑一致）
+                            sample_dict = {}
+                            for k, v in walk_tuple.items():
+                                if k.endswith(".id") or k.endswith(".Id"):
+                                    alias = k.split('.')[0]
+                                    sample_dict[alias] = v
+                            current_bitmap_samples.append(sample_dict)
+                            sampled = True
+                            break
+                    if not sampled:
+                        # 如果整个分区都失败，可以选择不添加样本（保持固定大小的灵活性）
+                        pass
+                    print(f"        Partition {p_idx+1}/{len(partitions)} (random walk) done.")
+                    continue
                 
                 t_p = time.time()
                 
                 # 1. 剪枝检查：看当前还缺多少覆盖
                 uncovered_mask_int = target_full_mask & ~template_covered_mask
                 if uncovered_mask_int == 0:
-                    break
+                    force_random = True
+                    continue
 
                 # ==================== 【同步优化：2 & 3. 内部 Mini-Batch 与 Top-K 剪枝】 ====================
                 FETCH_BATCH_SIZE = 2000
@@ -685,15 +644,16 @@ class JoinSampler:
                 cov_count = bin(template_covered_mask).count('1')
                 print(f"        Partition {p_idx+1}/{len(partitions)} done in {time.time()-t_p:.2f}s. Coverage: {cov_count}/{total_qids}")
 
-                if bin(template_covered_mask).count('1') / total_qids >= 0.99:
-                    print(f"        Coverage reached 99% after partition {p_idx+1}. Stop sampling partitions.")
-                    break
+                if cov_count / total_qids >= 0.99:
+                    # print(f"        Coverage reached 99% after partition {p_idx+1}. Stop sampling partitions.")
+                    # break
+                    force_random = True
 
             all_k_samples.append(current_bitmap_samples)
             
-            if bin(template_covered_mask).count('1') / total_qids >= 0.99:
-                print(f"        Coverage reached 99%. Stop sampling further bitmaps.")
-                break
+            # if bin(template_covered_mask).count('1') / total_qids >= 0.99:
+            #     print(f"        Coverage reached 99%. Stop sampling further bitmaps.")
+            #     break
                 
         return all_k_samples
 
@@ -755,7 +715,7 @@ class JoinSampler:
         if not my_tasks: return
 
         # 线性逐个 Template 执行
-        SAVE_BATCH_SIZE = 20
+        SAVE_BATCH_SIZE = 5
         current_batch_results = {}
         processed = 0
 
