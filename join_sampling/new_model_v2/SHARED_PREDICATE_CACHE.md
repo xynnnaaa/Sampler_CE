@@ -16,10 +16,11 @@
 
 ## 文件布局与容量
 
-默认根目录为配置文件所在目录的 `.predicate_cache/`。其下按运行 ID、数据库配置（不含密码）和格式版本哈希划分运行目录，再按真实表、排序后的谓词清单和块大小哈希划分表目录：
+默认根目录为配置文件所在目录的 `.predicate_cache/`。其下使用 query_file 文件名去掉扩展名的子目录，不再使用运行 ID 哈希。例如 `join_complexity_train.sql` 对应 `.predicate_cache/join_complexity_train/`。数据库配置（不含密码）和格式版本写入 namespace.json，身份不符时拒绝读取。表级子目录仍按真实表、排序后的谓词清单和块大小哈希划分：
 
 ```text
-<运行目录>/
+<query_file 文件名去掉扩展名>/
+  namespace.lock / namespace.json
   capacity.lock / capacity.json
   <表哈希>.lock
   <表哈希>/
@@ -39,9 +40,9 @@
 
 例如 IMDB cast_info 的 1,745 种谓词，默认分为 28 个块，约 7.56 GiB；此前逐谓词紧密打包估计的 7.36 GiB 不包含最后块的补齐。本轮所有表的完整缓存会多一些补齐空间。TPCH-skew 按已审计的谓词数及近似行数估计约 80.3 GiB，仅供容量规划，不是实际分配结果。
 
-`predicate_cache_max_gib` 默认 96，限制本轮缓存块和 ID 文件的总字节数，包括并发构建中预留的完整文件；不会把缺页加载后的共享物理页按 worker 数量重复计算，也不是 RAM/RSS 上限。构建时还有批次临时数组和连续 ID 的每行 1 bit 检查标记，这些不在文件额度内。
+`predicate_cache_max_gib` 默认 96，限制当前 workload 文件名目录的缓存块和 ID 文件的总字节数，包括并发构建中预留的完整文件；不会把缺页加载后的共享物理页按 worker 数量重复计算，也不是 RAM/RSS 上限。构建时还有批次临时数组和连续 ID 的每行 1 bit 检查标记，这些不在文件额度内。
 
-原 `annotation_memory_budget_gib` 独立限制各 worker 私有的 template 位图数组。缓存页、临时数组、路径对象和 PostgreSQL 内存必须另外考虑。旧运行缓存占用真实磁盘空间；容量限制只针对当前运行目录。默认不自动淘汰或删除旧运行文件，应在确认该运行的全部 worker 已结束后清理。
+原 `annotation_memory_budget_gib` 独立限制各 worker 私有的 template 位图数组。缓存页、临时数组、路径对象和 PostgreSQL 内存必须另外考虑。旧运行缓存占用真实磁盘空间；容量限制只针对当前 workload 文件名目录。默认不自动淘汰或删除旧运行文件，应在确认该运行的全部 worker 已结束后清理。
 
 ## 并发与中断
 
@@ -52,11 +53,11 @@
 - 缓存文件尺寸、清单和格式不符时明确报错，不静默接受半成品。
 - 缓存构建在申请 template 数组额度前执行，避免持有数组额度等待共享构建造成依赖死锁。
 
-## 运行 ID 与数据正确性
+## 自动复用与数据正确性
 
 基础表必须在整轮运行内保持稳定，谓词也必须是稳定的纯过滤表达式。缓存不是数据库快照；行数与 ID 检查不能检测列值更新。同一轮内各连接继续使用原隔离级别。
 
-`run_workers.sh` 每次启动会生成共同的 `JOIN_SAMPLING_CACHE_RUN_ID`，所有子进程共享。若调用者已设置该环境变量，脚本尊重它。单 worker 未指定 ID 时自动生成；手动多 worker 启动却没有共同 ID 时立即报错，避免各建一份缓存。可以在 sampling 配置中指定 `predicate_cache_run_id`，但复用旧值必须由调用者保证数据和数据库会话语义一致；仅 COUNT/MIN/MAX 相同不够。
+同一缓存根目录、query_file 文件名、数据库身份、谓词清单及块大小下，重复启动会自动复用已发布缓存。单 worker 和多 worker 都不再需要运行 ID；原 predicate_cache_run_id 和 JOIN_SAMPLING_CACHE_RUN_ID 不再使用。表级谓词清单变化会使用新的表级目录，不混用旧谓词。数据库列值变化却未修改谓词时无法自动发现；所有相关 worker 结束后应先删除对应 workload 目录再构建，仅 COUNT/MIN/MAX 相同不能证明数据没变。旧哈希目录不会自动迁移或删除，首次使用文件名目录需要重新构建。
 
 启动示例：
 

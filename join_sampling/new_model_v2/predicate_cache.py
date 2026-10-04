@@ -1,4 +1,4 @@
-"""Immutable, run-scoped predicate blocks shared by workers through read-only mmap.
+"""Immutable predicate blocks shared by workers through read-only mmap.
 
 Each row occupies one little-endian uint64 per block of up to 64 predicates.
 No QIDs or sampler random state are stored here. Base tables must stay unchanged.
@@ -101,11 +101,12 @@ class CachedTable:
 
 
 class SharedPredicateCache:
-    def __init__(self, directory, run_id, database_identity, predicates,
+    def __init__(self, directory, cache_name, database_identity, predicates,
                  timings, batch_size=10000, block_size=64, max_bytes=96 * 2**30):
-        if not run_id:
-            raise ValueError('A common predicate cache run ID is required')
-        self.root = Path(directory) / digest([FORMAT_VERSION, run_id, database_identity])
+        if (not cache_name or cache_name in ('.', '..')
+                or Path(cache_name).name != cache_name):
+            raise ValueError('Predicate cache name must be a single directory name')
+        self.root = Path(directory) / cache_name
         self.root.mkdir(parents=True, exist_ok=True)
         self.predicates = {table: sorted(set(values.values())) for table, values in predicates.items()}
         self.timings = timings
@@ -115,6 +116,19 @@ class SharedPredicateCache:
         self.manifests = {}
         if self.batch_size <= 0 or not 1 <= self.block_size <= 64 or self.max_bytes <= 0:
             raise ValueError('Invalid predicate cache batch size, block size, or capacity')
+        # A readable name alone cannot distinguish two databases with the same
+        # workload basename. Validate ownership before accepting cached tables.
+        identity = {'version': FORMAT_VERSION, 'database': database_identity}
+        with file_lock(self.root / 'namespace.lock', self.timings,
+                       'predicate_cache.namespace_lock_wait'):
+            path = self.root / 'namespace.json'
+            if path.exists():
+                if json.loads(path.read_text()) != identity:
+                    raise ValueError(f'{self.root}: predicate cache database/format mismatch; '
+                                     'choose another predicate_cache_dir or remove this cache '
+                                     'after all its workers have stopped')
+            else:
+                atomic_json(path, identity)
 
     def _key(self, table):
         return digest([table, self.predicates[table], self.block_size])

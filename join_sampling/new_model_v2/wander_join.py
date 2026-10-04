@@ -200,14 +200,13 @@ class WanderJoinEngine:
                 chosen_id = chosen.get(f"{alias}.id") or chosen.get(f"{alias}.Id")
                 qid_mask = translated_map.get(chosen_id, my_global_mask)
 
-                # 更新当前路径的状态
-                new_path = {
-                    'vals': path['vals'].copy(),
-                    'acc_bmp': path['acc_bmp'] & qid_mask,
-                    'alive': True
-                }
-                new_path['vals'].update(chosen)
-                surviving_paths.append(new_path)
+                # Linear sampler owns each path and its private vals dict:
+                # root clones are independent, and callers discard the previous
+                # active list. Read shared neighbor rows without modifying them.
+                path['acc_bmp'] &= qid_mask
+                path['vals'].update(chosen)
+                path['alive'] = True
+                surviving_paths.append(path)
 
         self.timings.counters['wander_join.paths_out'] += len(surviving_paths)
         return surviving_paths

@@ -203,6 +203,20 @@ class SharedCacheChecks(unittest.TestCase):
             self.assertEqual(first.lookup_many('a', [1]), {'1': 1})
             self.assertEqual(second.lookup_many('a', [1]), {'1': 0})
 
+    def test_readable_directory_reuses_cache_and_rejects_other_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = self.cache(directory, {0: 'p0'}, run='join_complexity_train')
+            self.assertEqual(cache.root, Path(directory)/'join_complexity_train')
+            with redirect_stdout(io.StringIO()):
+                cache.ensure(Connection([{'id': 1}]), 't')
+            second = self.cache(directory, {0: 'p0'}, run='join_complexity_train')
+            conn = Connection([{'id': 1}])
+            second.ensure(conn, 't')
+            self.assertEqual(conn.statements, [])
+            with self.assertRaisesRegex(ValueError, 'database/format mismatch'):
+                SharedPredicateCache(directory, 'join_complexity_train', {'dbname': 'other'},
+                                     {'t': {0: 'p0'}}, SamplingTimings())
+
     def test_capacity_bound_and_truncated_file_rejection(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = self.cache(directory, {0: 'p0'}, max_bytes=7)

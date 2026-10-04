@@ -143,8 +143,11 @@ class SamplingEquivalence(unittest.TestCase):
             old,new=fixture(False),fixture(True)
             with redirect_stdout(io.StringIO()):
                 random.seed(seed);before=old.sample_for_one_template(KEY,DATA)
+                before_random_state = random.getstate()
                 random.seed(seed);after=new.sample_for_one_template(KEY,DATA)
+                after_random_state = random.getstate()
             self.assertEqual(before,after)
+            self.assertEqual(before_random_state, after_random_state)
             def neighbor_only(conn):return [q for q in conn.neighbor_queries if '_anno_idx' not in q]
             self.assertEqual(neighbor_only(old.conn),neighbor_only(new.conn))
             for k in old.timings.counters:

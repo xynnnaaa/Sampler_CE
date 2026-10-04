@@ -34,7 +34,6 @@ from wander_join import WanderJoinEngine
 from sampling_timing import timed, timed_template
 from template_annotations import TemplateAnnotations, SharedMemoryBudget
 from predicate_cache import SharedPredicateCache
-import uuid
 
 
 # --- 工具函数 ---
@@ -214,7 +213,7 @@ class JoinSampler:
         self.predicate_cache_enabled = samp_conf.get('predicate_cache_enabled', True)
         self.predicate_cache_dir = samp_conf.get(
             'predicate_cache_dir', os.path.join(os.path.dirname(os.path.abspath(config_path)), '.predicate_cache'))
-        self.predicate_cache_run_id = os.environ.get('JOIN_SAMPLING_CACHE_RUN_ID') or samp_conf.get('predicate_cache_run_id')
+        self.predicate_cache_name = os.path.splitext(os.path.basename(self.sql_file))[0]
         self.predicate_cache_block_size = samp_conf.get('predicate_cache_block_size', 64)
         self.predicate_cache_max_gib = float(samp_conf.get('predicate_cache_max_gib', 96))
         budget_gib = float(samp_conf.get('annotation_memory_budget_gib', 96))
@@ -749,11 +748,6 @@ class JoinSampler:
     def sample(self, worker_id=0, num_workers=1):
         print(f"Starting Join Sampling Process (Linear Baseline) (Worker {worker_id}/{num_workers})...")
         t_start = time.time()
-        if self.predicate_cache_enabled and not self.predicate_cache_run_id:
-            if num_workers > 1:
-                raise ValueError('Parallel workers require a common fresh JOIN_SAMPLING_CACHE_RUN_ID; '
-                                 'use run_workers.sh or set the same ID for all workers')
-            self.predicate_cache_run_id = uuid.uuid4().hex
         
         self.load_and_parse_workload()
 
@@ -776,11 +770,11 @@ class JoinSampler:
         if self.predicate_cache_enabled:
             identity = {key: value for key, value in self.db_config.items() if key != 'password'}
             self.annotation_predicate_cache = SharedPredicateCache(
-                self.predicate_cache_dir, self.predicate_cache_run_id, identity,
+                self.predicate_cache_dir, self.predicate_cache_name, identity,
                 self.global_pid_to_pred, self.timings, batch_size=self.annotation_batch_size,
                 block_size=self.predicate_cache_block_size,
                 max_bytes=int(self.predicate_cache_max_gib * 2**30))
-            print(f'Predicate cache run: {self.predicate_cache_run_id}, '
+            print(f'Predicate cache workload: {self.predicate_cache_name}, '
                   f'directory: {self.annotation_predicate_cache.root}', flush=True)
 
         # 线性逐个 Template 执行

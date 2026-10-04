@@ -32,17 +32,36 @@
 
 生成的 SQL 和内存预算不消耗 Python 全局随机数。正常执行时不改变随机选择次数。
 
+## 路径更新优化：原地修改私有状态
+
+`wander_join.py::extend_paths_one_step()` 在选定邻居、取得 QID 掩码后，直接更新当前路径：
+
+```python
+path['acc_bmp'] &= qid_mask
+path['vals'].update(chosen)
+path['alive'] = True
+surviving_paths.append(path)
+```
+
+此前每个成功扩展步骤都会创建新的 path 字典、复制整个 vals 字典，再写入邻居。现在复用这两个字典，仍创建按原顺序排列的存活路径列表。Root 初始化继续为每条路径执行 `clean_data.copy()`，保证各路径的 vals 独立；共享邻居字典只读，不原地修改邻居。
+
+这个优化依赖当前 linear sampler 的对象所有权：路径只向一个邻居扩展，调用方以返回列表替换旧 active_paths，不保留旧路径快照。未来若增加分叉、历史状态或外部缓存，需要重新检查共享引用。该接口现在会原地修改输入路径。
+
+采样参数、候选及路径顺序、随机选择调用、零掩码路径继续扩展、失效路径过滤和交集评分保持一致。原 `wander_join.intersection_and_path_update_python` 计时项保留，便于前后比较；本次未优化 root 初始复制，也未更改路径表示。
+
+验证：新增路径与 vals 对象复用、路径间隔离、共享邻居不变、失效路径过滤及零掩码保留测试；30 个随机种子的 V1/V2 完整采样对照同时检查最终随机数状态。性能提升需用同一 workload 的新日志测量。本改动不会自动启动采样或重启已有 worker。
+
 ## 默认流程：共享谓词缓存 → template QID 位图
 
 默认启用 `predicate_cache_enabled=true`。完整解析 workload 后，按真实表收集并排序不同的完整谓词组合。首次用到一张有过滤条件的表时，一个 worker 获取该表文件锁，以每块最多 64 个谓词批量扫描原表，保存每行一个小端 uint64 的命中块；其他 worker 等待后直接复用。
 
-缓存按运行 ID、数据库配置（不含密码）、真实表、精确谓词 SQL 清单、块大小及格式版本隔离。构建先写临时目录，完成验证并写入 manifest 后原子发布整个目录；缓存文件只读映射。普通退出或强制终止后的半成品不会被读取，后续构建者可回收并重建。
+缓存根目录按 query_file 文件名去掉扩展名命名，例如 `.predicate_cache/join_complexity_train/`，不再使用运行 ID 或根目录哈希。`namespace.json` 检查数据库配置（不含密码）和格式版本；表级子目录仍按真实表、精确谓词 SQL 清单和块大小哈希区分。构建先写临时目录，完成验证并写入 manifest 后原子发布整个目录；缓存文件只读映射。普通退出或强制终止后的半成品不会被读取，后续构建者可回收并重建。
 
 当前 template 只读取需要的谓词块，使用 NumPy 分块组装 `uint64[N, ceil(Q/64)]` QID 矩阵。无谓词查询仍贡献恒定位，NULL 仍为不命中；不同 alias、不同 QID 顺序分别组装。结果仍写入原 `AliasBitmaps.buffer`，采样阶段的查询、交集和评分接口不变。没有逐行遍历全局 PID 的 Python 翻译。
 
 缓存构建在申请 template 位图额度前完成，首次构建及等待均计入当前 template 时间。共享元数据中的 COUNT/MIN/MAX 同时用于后续 template 预分配，不再由各 worker 重复查询。连续 ID 表不排序，稀疏 ID 表排序，并跨谓词块核对 ID 序列。
 
-运行期间基础表及谓词语义必须稳定，不适用于随时间或随机状态改变的谓词。默认每次脚本启动产生新的共同运行 ID，避免重用旧数据缓存。单 worker 自动产生自己的 ID；手动多 worker 启动必须设置相同的新 `JOIN_SAMPLING_CACHE_RUN_ID`，否则报错。详见 [共享缓存改动说明](SHARED_PREDICATE_CACHE.md)。
+运行期间基础表及谓词语义必须稳定，不适用于随时间或随机状态改变的谓词。同一 config 和 query_file 重跑时自动复用完整缓存，手动启动多个 worker 也不再需要共同运行 ID。数据库身份相同不代表数据没变；基础表更新后，应在所有相关 worker 结束后删除对应文件名目录再运行。旧哈希目录不自动迁移，首次使用新目录会重新构建。详见 [共享缓存改动说明](SHARED_PREDICATE_CACHE.md)。
 
 ## 关闭共享缓存时的直接 SQL 构建
 
@@ -99,7 +118,7 @@ buffer_bytes = N × row_bytes
 
 每个 worker 只拥有当前 template 的位图，所有分区与 Bitmap 复用。template 返回、异常退出时都在 finally 中释放；关闭 sampler 时再次幂等清理。
 
-共享谓词文件在 template 之间保留，组装结束立即关闭 mmap；操作系统可以保留或回收共享文件缓存页。`predicate_cache_max_gib` 默认 96 GiB，限制本轮缓存的持久块文件、ID 文件及并发构建的这些文件，不是 RSS 上限，也不包含下面的 template 位图额度。没有自动 LRU 淘汰，超容量会报错。默认文件放在配置文件目录的 `.predicate_cache/` 下；旧运行文件不会自动删除，确认对应运行的所有 worker 结束后再清理旧目录。
+共享谓词文件在 template 之间保留，组装结束立即关闭 mmap；操作系统可以保留或回收共享文件缓存页。`predicate_cache_max_gib` 默认 96 GiB，限制当前 workload 文件名目录的持久块文件、ID 文件及并发构建的这些文件，不是 RSS 上限，也不包含下面的 template 位图额度。没有自动 LRU 淘汰，超容量会报错。默认文件放在配置文件目录的 `.predicate_cache/` 下；旧运行文件不会自动删除，确认对应运行的所有 worker 结束后再清理旧目录。
 
 多个 worker 构建前先申请当前 template 的**全部数组及临时 ID 检查标记的字节预算**，不足时等待；不会逐 alias 申请导致多个 worker 各持有部分内存而互相等待。超过整个预算的单个 template 会报错。进程退出后的过期额度会被后续申请回收，使用进程启动时间防止 PID 重用。
 
@@ -125,7 +144,7 @@ buffer_bytes = N × row_bytes
 }
 ```
 
-除示例 `annotation_budget_path` 外，上述数值均为默认值。可选 `predicate_cache_dir` 控制缓存根目录；`predicate_cache_run_id` 可显式指定共同运行 ID，环境变量 `JOIN_SAMPLING_CACHE_RUN_ID` 优先。显式复用旧 ID 由调用方保证数据未变化，不能用 COUNT/MIN/MAX 判断数据版本。这些项不改变采样参数。
+除示例 `annotation_budget_path` 外，上述数值均为默认值。可选 `predicate_cache_dir` 控制缓存根目录，其下子目录名固定来自 query_file 的文件名。`predicate_cache_run_id` 和 `JOIN_SAMPLING_CACHE_RUN_ID` 不再使用。自动复用由调用方保证数据未变化，不能用 COUNT/MIN/MAX 判断数据版本。这些项不改变采样参数。
 
 单个 worker：
 
@@ -141,14 +160,13 @@ cd /home/Sampler_CE/join_sampling/new_model_v2
 CONFIG=/path/to/tpch_v2_config.json
 LOG_DIR=/path/to/v2_logs
 mkdir -p "$LOG_DIR"
-export JOIN_SAMPLING_CACHE_RUN_ID=$(cat /proc/sys/kernel/random/uuid)
 for ((i=0; i<10; i++)); do
     nohup python3 -u join_sampler_linear.py "$CONFIG" "$i" 10 \
         > "$LOG_DIR/log_worker_$i.log" 2>&1 &
 done
 ```
 
-也可直接执行 `bash run_workers.sh <config_path> 10 <log_dir>`；脚本自动设置共同运行 ID，并通过绝对路径启动主程序。使用原项目能够运行 sampler 的 Python 环境，需要 NumPy、psycopg2、networkx、sqlglot 等现有依赖。
+也可直接执行 `bash run_workers.sh <config_path> 10 <log_dir>`；所有 worker 自动使用同一 workload 文件名目录，脚本通过绝对路径启动主程序。使用原项目能够运行 sampler 的 Python 环境，需要 NumPy、psycopg2、networkx、sqlglot 等现有依赖。
 
 ## 新计时项与比较方法
 
