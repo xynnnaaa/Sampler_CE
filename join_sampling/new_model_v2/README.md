@@ -9,6 +9,8 @@
 | `join_sampler_linear.py` | 采样主程序，接入当前 template 位图的构建和释放 |
 | `wander_join.py` | 保留 linear 流程实际使用的邻居查询和单步随机扩展，直接读取内存 QID 掩码 |
 | `template_annotations.py` | 位图构建、紧凑内存存储、ID 定位、多个 worker 的内存预算 |
+| `predicate_cache.py` | 按表批量构建谓词命中块、原子发布、文件锁和跨 worker 只读 mmap |
+| `cal_time.py` | 解析日志，汇总原始、扣等待后的累计时间和缓存构建时间 |
 | `sampling_timing.py` | 原版分阶段计时，增加准备、流式读取、内存查询、释放和进程峰值 RSS 统计 |
 
 未复制数据集、配置、日志、`cal_time.py`、旧的 beam/lookahead 接口或其他辅助程序。主程序仍依赖项目现有的 `mscn.query_representation.utils`，SQL 解析器未修改。
@@ -30,7 +32,19 @@
 
 生成的 SQL 和内存预算不消耗 Python 全局随机数。正常执行时不改变随机选择次数。
 
-## 位图准备
+## 默认流程：共享谓词缓存 → template QID 位图
+
+默认启用 `predicate_cache_enabled=true`。完整解析 workload 后，按真实表收集并排序不同的完整谓词组合。首次用到一张有过滤条件的表时，一个 worker 获取该表文件锁，以每块最多 64 个谓词批量扫描原表，保存每行一个小端 uint64 的命中块；其他 worker 等待后直接复用。
+
+缓存按运行 ID、数据库配置（不含密码）、真实表、精确谓词 SQL 清单、块大小及格式版本隔离。构建先写临时目录，完成验证并写入 manifest 后原子发布整个目录；缓存文件只读映射。普通退出或强制终止后的半成品不会被读取，后续构建者可回收并重建。
+
+当前 template 只读取需要的谓词块，使用 NumPy 分块组装 `uint64[N, ceil(Q/64)]` QID 矩阵。无谓词查询仍贡献恒定位，NULL 仍为不命中；不同 alias、不同 QID 顺序分别组装。结果仍写入原 `AliasBitmaps.buffer`，采样阶段的查询、交集和评分接口不变。没有逐行遍历全局 PID 的 Python 翻译。
+
+缓存构建在申请 template 位图额度前完成，首次构建及等待均计入当前 template 时间。共享元数据中的 COUNT/MIN/MAX 同时用于后续 template 预分配，不再由各 worker 重复查询。连续 ID 表不排序，稀疏 ID 表排序，并跨谓词块核对 ID 序列。
+
+运行期间基础表及谓词语义必须稳定，不适用于随时间或随机状态改变的谓词。默认每次脚本启动产生新的共同运行 ID，避免重用旧数据缓存。单 worker 自动产生自己的 ID；手动多 worker 启动必须设置相同的新 `JOIN_SAMPLING_CACHE_RUN_ID`，否则报错。详见 [共享缓存改动说明](SHARED_PREDICATE_CACHE.md)。
+
+## 关闭共享缓存时的直接 SQL 构建
 
 每个 template 只为当前 alias 构建位图。解析阶段的 PID 仍用于恢复谓词 SQL 和对重复谓词组合分组，但不会读取或创建全局 PID anno 表，也不会在采样时执行 PID→QID 翻译。
 
@@ -63,7 +77,7 @@ FROM base_table;
 
 ## 紧凑表示与 ID 定位
 
-使用标准库 `bytearray` 连续保存位图，布局等价于小端 `uint64[N, ceil(Q/64)]`，无需给新版位图模块增加 NumPy 依赖。
+使用标准库 `bytearray` 连续保存最终位图，布局等价于小端 `uint64[N, ceil(Q/64)]`。共享缓存的批量打包和 QID 组装需要 NumPy（已在原项目运行环境中使用）。
 
 ```text
 row_bytes = ceil(Q / 64) × 8
@@ -85,6 +99,8 @@ buffer_bytes = N × row_bytes
 
 每个 worker 只拥有当前 template 的位图，所有分区与 Bitmap 复用。template 返回、异常退出时都在 finally 中释放；关闭 sampler 时再次幂等清理。
 
+共享谓词文件在 template 之间保留，组装结束立即关闭 mmap；操作系统可以保留或回收共享文件缓存页。`predicate_cache_max_gib` 默认 96 GiB，限制本轮缓存的持久块文件、ID 文件及并发构建的这些文件，不是 RSS 上限，也不包含下面的 template 位图额度。没有自动 LRU 淘汰，超容量会报错。默认文件放在配置文件目录的 `.predicate_cache/` 下；旧运行文件不会自动删除，确认对应运行的所有 worker 结束后再清理旧目录。
+
 多个 worker 构建前先申请当前 template 的**全部数组及临时 ID 检查标记的字节预算**，不足时等待；不会逐 alias 申请导致多个 worker 各持有部分内存而互相等待。超过整个预算的单个 template 会报错。进程退出后的过期额度会被后续申请回收，使用进程启动时间防止 PID 重用。
 
 默认同一个配置文件的 worker 共享 `/tmp/join_sampling_v2_<配置路径哈希>.json` 及其 `.lock` 文件。该文件只记录额度，不存位图；不是 anno 数据表或位图文件。不同配置如需共用总预算，应显式设置相同的 `annotation_budget_path`，并使用相同预算值。
@@ -101,11 +117,15 @@ buffer_bytes = N × row_bytes
 {
   "annotation_batch_size": 10000,
   "annotation_memory_budget_gib": 96,
-  "annotation_budget_path": "/tmp/join_sampling_v2_shared_budget.json"
+  "annotation_budget_path": "/tmp/join_sampling_v2_shared_budget.json",
+  "predicate_cache_enabled": true,
+  "predicate_cache_block_size": 64,
+  "predicate_cache_max_gib": 96,
+  "annotation_compose_batch_size": 65536
 }
 ```
 
-其中前两项为默认值；省略第三项时自动按配置文件绝对路径选择共享额度文件。这些项只控制位图读取批次和内存容量，不改变采样参数。
+除示例 `annotation_budget_path` 外，上述数值均为默认值。可选 `predicate_cache_dir` 控制缓存根目录；`predicate_cache_run_id` 可显式指定共同运行 ID，环境变量 `JOIN_SAMPLING_CACHE_RUN_ID` 优先。显式复用旧 ID 由调用方保证数据未变化，不能用 COUNT/MIN/MAX 判断数据版本。这些项不改变采样参数。
 
 单个 worker：
 
@@ -121,17 +141,26 @@ cd /home/Sampler_CE/join_sampling/new_model_v2
 CONFIG=/path/to/tpch_v2_config.json
 LOG_DIR=/path/to/v2_logs
 mkdir -p "$LOG_DIR"
+export JOIN_SAMPLING_CACHE_RUN_ID=$(cat /proc/sys/kernel/random/uuid)
 for ((i=0; i<10; i++)); do
     nohup python3 -u join_sampler_linear.py "$CONFIG" "$i" 10 \
         > "$LOG_DIR/log_worker_$i.log" 2>&1 &
 done
 ```
 
-使用原项目能够运行 sampler 的 Python 环境。新版内存模块和预算模块只使用标准库；主程序仍需要原项目的 psycopg2、networkx、sqlglot 等依赖。
+也可直接执行 `bash run_workers.sh <config_path> 10 <log_dir>`；脚本自动设置共同运行 ID，并通过绝对路径启动主程序。使用原项目能够运行 sampler 的 Python 环境，需要 NumPy、psycopg2、networkx、sqlglot 等现有依赖。
 
 ## 新计时项与比较方法
 
 - `annotations.prepare`：完整位图准备，包含元数据查询、预算等待、分配与构建。
+- `predicate_cache.build`：首次批量构建整张表的谓词缓存。
+- `predicate_cache.table_lock_wait`：等待其他 worker 完成同表构建。
+- `predicate_cache.stats.execute / fetchone`、`predicate_cache.scan.execute / fetchmany`：缓存构建中的数据库操作。
+- `predicate_cache.pack_and_store_python`：批次打包、ID 验证和写入文件。
+- `predicate_cache.open_table / open_mmap`：打开缓存描述和实际只读映射。
+- `annotations.compose_qids_numpy`：当前 template 的分块 QID 组装。
+- 缓存计数含 `table_hits`、`tables_built`、`scans`、`rows_scanned`、`predicates_built`、`bytes_built`、`blocks_mapped`、`mapped_bytes`；映射字节数是累计打开空间，不能作为物理内存峰值。
+- `annotations.rows_composed / predicates_reused`：组装行数和使用的谓词组合数。
 - `annotations.stats.execute / fetchone`：元数据聚合。
 - `annotations.stats.cache_hits / cache_misses`：元数据缓存命中与首次查询次数（计数项）。
 - `annotations.scan.execute / fetchmany`：命名游标建立和数据库批次读取；服务端谓词计算可能发生在 FETCH，因此不能只看 execute。
@@ -147,7 +176,27 @@ done
 
 每个 Bitmap 报告只包含采样阶段；最终 template 报告包含位图准备、采样和释放。DB 汇总包含 execute、fetchone、fetchmany、fetchall。比较性能以 template wall 为准，不能把预处理排除后宣称整体加速，也不能相加 inclusive 嵌套阶段。
 
-## 验证结果与范围
+统计日志：
+
+```bash
+python cal_time.py imdb/runfile_join_complexity
+python cal_time.py tpch-skew/runfile --json /tmp/tpch_time.json --csv /tmp/tpch_templates.csv
+```
+
+不传路径默认统计 `imdb/runfile_join_complexity`。脚本只使用标准库，支持运行中日志，仅汇总完整 Template 报告；不累加 Bitmap 或重复的 inclusive/exclusive 数值。默认输出净累计时间（扣缓存锁等待、保留首次构建），并另外显示扣位图额度等待的累计时间和在线处理时间。缓存构建内的 capacity_lock_wait 会避免重复扣除；失败/空结果报告仍保留成本并显示状态。无统一开始/结束时间戳时不将最大 worker 时长宣称为精确的整轮实际时间，也不外推剩余时间。
+
+## 共享缓存重构的验证
+
+- `tests/` 中 16 项测试通过，覆盖直接 SQL 与缓存组装逐字节一致、跨 template/worker 复用、稀疏 ID、空表、NULL、字符串、QID 边界、容量限制、四进程竞争和强制终止构建者后的恢复。
+- 缓存启用时，30 个随机种子下的三表采样结果、邻居 SQL 顺序及采样计数与 V1 一致。
+- 真实 PostgreSQL 的事务临时表验证通过：连续/稀疏 ID、两个 alias、72 种谓词及 1/64/65/200/1042 个 QID，与直接 SQL 的最终缓冲区完全一致；结束后回滚，未修改数据集表。
+- 未启动完整数据集采样；实际速度和并发内存需通过新日志测量。
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+## 初版验证记录（历史）
 
 - 所有四个 Python 文件通过语法检查。
 - 11 项本地模拟测试通过：位序与填充、64/65/200/1042 位边界、连续/稀疏/负/大 ID、NULL 条件、零位图、重复谓词、多 alias、恒定位图、空表、异常释放、多进程额度及死进程额度回收。

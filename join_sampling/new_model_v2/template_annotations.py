@@ -154,7 +154,8 @@ class AliasBitmaps:
 
 
 class TemplateAnnotations:
-    def __init__(self, timings, batch_size=10000, budget=None, table_stats_cache=None):
+    def __init__(self, timings, batch_size=10000, budget=None, table_stats_cache=None,
+                 predicate_cache=None, compose_batch_size=65536):
         self.timings = timings
         self.batch_size = int(batch_size)
         if self.batch_size <= 0:
@@ -167,6 +168,10 @@ class TemplateAnnotations:
         # Owned by the sampler/connection and retained across template releases.
         # The workload's base tables must remain unchanged during this run.
         self.table_stats_cache = {} if table_stats_cache is None else table_stats_cache
+        self.predicate_cache = predicate_cache
+        self.compose_batch_size = int(compose_batch_size)
+        if self.compose_batch_size <= 0:
+            raise ValueError('annotation_compose_batch_size must be positive')
 
     @staticmethod
     def sql_expression(plan, query_count):
@@ -213,12 +218,16 @@ class TemplateAnnotations:
                         continue
                     if plan.table not in table_stats:
                         self.timings.counters['annotations.stats.cache_misses'] += 1
-                        with conn.cursor() as cursor:
-                            with self.timings.span('annotations.stats.execute'):
-                                cursor.execute(f'SELECT COUNT(*), MIN(id), MAX(id) FROM '
-                                               f'{quote_identifier(plan.table)}')
-                            with self.timings.span('annotations.stats.fetchone'):
-                                table_stats[plan.table] = cursor.fetchone()
+                        if self.predicate_cache is not None:
+                            manifest = self.predicate_cache.ensure(conn, plan.table)
+                            table_stats[plan.table] = (manifest['count'], manifest['first'], manifest['last'])
+                        else:
+                            with conn.cursor() as cursor:
+                                with self.timings.span('annotations.stats.execute'):
+                                    cursor.execute(f'SELECT COUNT(*), MIN(id), MAX(id) FROM '
+                                                   f'{quote_identifier(plan.table)}')
+                                with self.timings.span('annotations.stats.fetchone'):
+                                    table_stats[plan.table] = cursor.fetchone()
                     else:
                         self.timings.counters['annotations.stats.cache_hits'] += 1
                     count, first, last = table_stats[plan.table]
@@ -231,7 +240,8 @@ class TemplateAnnotations:
                 # One transient bit per dense row checks uniqueness despite the
                 # unordered stream. Aliases are filled sequentially.
                 scratch_bytes = max(((plan.row_count + 7) // 8 for plan in plans
-                                     if plan.predicate_masks and plan.dense), default=0)
+                                     if plan.predicate_masks and plan.dense
+                                     and self.predicate_cache is None), default=0)
                 estimate += scratch_bytes
                 self.timings.counters['annotations.validation_scratch_bytes'] = scratch_bytes
                 self.timings.counters['annotations.planned_bytes'] = estimate
@@ -253,13 +263,56 @@ class TemplateAnnotations:
                           f'rows={plan.row_count}, '
                           f'layout={"dense" if plan.dense else "sparse"}, '
                           f'buffer={store.nbytes / 2**30:.3f} GiB', flush=True)
-                    self._fill(conn, plan, store)
+                    if self.predicate_cache is None:
+                        self._fill(conn, plan, store)
+                    else:
+                        self._fill_from_cache(conn, plan, store)
                 self.timings.counters['annotations.buffer_bytes'] = self.nbytes
                 self.timings.counters['annotations.aliases'] = len(self.aliases)
                 print(f'    [Annotations] Ready: {self.nbytes / 2**30:.3f} GiB', flush=True)
         except BaseException:
             self.release()
             raise
+
+    def _fill_from_cache(self, conn, plan, store):
+        import numpy as np
+        with self.timings.span(f'annotations.build_alias.{plan.alias}'):
+            with self.timings.span('predicate_cache.open_table'):
+                cached = self.predicate_cache.open(conn, plan.table)
+            with cached:
+                if (cached.count != plan.row_count or cached.first != plan.first_id
+                        or cached.dense != plan.dense):
+                    raise RuntimeError(f'{plan.table}: inconsistent cache metadata')
+                words = store.row_bytes // 8
+                output = np.frombuffer(store.buffer, dtype='<u8').reshape(plan.row_count, words)
+                grouped = {}
+                full_word = (1 << 64) - 1
+                for predicate, mask in plan.predicate_masks.items():
+                    block, bit = cached.locations[predicate]
+                    contributions = [(j, np.uint64((mask >> (64*j)) & full_word))
+                                     for j in range(words) if (mask >> (64*j)) & full_word]
+                    grouped.setdefault(block, []).append((bit, contributions))
+                constants = np.array([(plan.global_mask >> (64*j)) & full_word
+                                      for j in range(words)], dtype='<u8')
+                with self.timings.span('annotations.compose_qids_numpy'):
+                    for start in range(0, plan.row_count, self.compose_batch_size):
+                        end = min(start + self.compose_batch_size, plan.row_count)
+                        target = output[start:end]
+                        target[:] = constants
+                        for block, predicates in grouped.items():
+                            values = cached.block(block)[start:end]
+                            for bit, contributions in predicates:
+                                hits = (values & np.uint64(1 << bit)) != 0
+                                for word, contribution in contributions:
+                                    np.bitwise_or(target[:, word], contribution,
+                                                  out=target[:, word], where=hits)
+                        if store.ids is not None:
+                            np.frombuffer(store.ids, dtype=np.int64)[start:end] = cached.ids_array()[start:end]
+                    # Drop views before closing the mmap in CachedTable.__exit__.
+                    if plan.row_count:
+                        del values, target, hits
+                self.timings.counters['annotations.rows_composed'] += plan.row_count
+                self.timings.counters['annotations.predicates_reused'] += len(plan.predicate_masks)
 
     def _fill(self, conn, plan, store):
         # A named psycopg2 cursor streams FETCH batches, unlike client fetchmany.

@@ -15,3 +15,4 @@ mscn/results
 mscn/runfile
 join_sampling/embedding/join
 join_sampling/embedding/single_table_allhit
+join_sampling/new_model_v2/imdb/.predicate_cache
