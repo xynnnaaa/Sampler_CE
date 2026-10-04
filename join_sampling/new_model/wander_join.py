@@ -7,12 +7,14 @@ import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import numpy as np
+from sampling_timing import SamplingTimings, timed
 
 class WanderJoinEngine:
     def __init__(self, conn, cursor):
         self.conn = conn
         self.cursor = cursor
         self.bitmap_cache = {}
+        self.timings = SamplingTimings()
 
     def connect(self):
         # if not self.conn:
@@ -63,6 +65,7 @@ class WanderJoinEngine:
 
 
     # 获取所有可以和current_beam中元组连接的下一个邻居表的元组
+    @timed('neighbors.total')
     def _batch_fetch_neighbors(self, table_real_name, my_join_col, parent_vals, sels, alias):
         """
         批量获取邻居。同时查询出sels中所有连接列, 不Join Sidecar, 不查Bitmap
@@ -107,10 +110,15 @@ class WanderJoinEngine:
         #     JOIN temp_partition_filter pf ON t.{my_join_col} = pf.pid
         # """
 
-        execute_start = time.time()
-        self.cursor.execute(sql)
-        execute_query_time = time.time() - execute_start
-        rows = self.cursor.fetchall()
+        execute_start = time.perf_counter()
+        with self.timings.span('neighbors.execute'):
+            self.cursor.execute(sql)
+        execute_query_time = time.perf_counter() - execute_start
+        with self.timings.span('neighbors.fetchall'):
+            rows = self.cursor.fetchall()
+        self.timings.counters['neighbors.queries'] += 1
+        self.timings.counters['neighbors.rows'] += len(rows)
+        self.timings.counters['neighbors.keys'] += len(unique_vals)
         
         # 结果分组
         # neighbors = { parent_join_val: [ row_dict, ... ] }
@@ -128,36 +136,41 @@ class WanderJoinEngine:
             print(f"Error determining join column index: {e}")
             return {}, execute_query_time
 
-        for r in rows:
-            p_val = str(r[join_col_idx])
+        with self.timings.span('neighbors.group_rows_python'):
+            for r in rows:
+                p_val = str(r[join_col_idx])
 
-            row_data = {}
-            for i, key in enumerate(result_keys):
-                row_data[key] = str(r[i]) if r[i] is not None else None
+                row_data = {}
+                for i, key in enumerate(result_keys):
+                    row_data[key] = str(r[i]) if r[i] is not None else None
                 
-            neighbors[p_val].append(row_data)
+                neighbors[p_val].append(row_data)
             
         return neighbors, execute_query_time
     
+    @timed('anno.total')
     def _batch_fetch_translate_bitmaps(self, table_real_name, ids, workload_name="", alias="", pid_map={}, global_map=0):
         """
         [新增] 给定一批主键 ID，批量从 Sidecar 表获取 Bitmap 并翻译，存入缓存。
         """
         execute_query_time = 0.0
-        unique_ids = list(set(ids))
+        with self.timings.span('anno.cache_lookup_python'):
+            unique_ids = list(set(ids))
 
-        result_map = {} # {id_str: qid_int}
-        missing_ids = []
+            result_map = {} # {id_str: qid_int}
+            missing_ids = []
 
-        # 统一使用字符串形式的 id 作为 cache key，保证一致性
-        for uid in unique_ids:
-            uid_str = str(uid)
-            cache_key = (alias, uid_str)
-            if cache_key in self.bitmap_cache:
-                result_map[uid_str] = self.bitmap_cache[cache_key]
-            else:
-                missing_ids.append(uid_str)
+            # 统一使用字符串形式的 id 作为 cache key，保证一致性
+            for uid in unique_ids:
+                uid_str = str(uid)
+                cache_key = (alias, uid_str)
+                if cache_key in self.bitmap_cache:
+                    result_map[uid_str] = self.bitmap_cache[cache_key]
+                else:
+                    missing_ids.append(uid_str)
 
+        self.timings.counters['anno.cache_hits'] += len(unique_ids) - len(missing_ids)
+        self.timings.counters['anno.cache_misses'] += len(missing_ids)
         if missing_ids:
             vals_str = ",".join([f"'{v}'" for v in missing_ids])
             sidecar = f"{table_real_name}_anno_idx_{workload_name}" if workload_name else f"{table_real_name}_anno_idx"
@@ -184,16 +197,21 @@ class WanderJoinEngine:
             #     JOIN temp_partition_filter pf ON {sidecar}.query_anno_id = pf.pid
             # """
 
-            execute_start = time.time()
-            self.cursor.execute(sql)
-            execute_query_time += time.time() - execute_start
-            rows = self.cursor.fetchall()
-            for r in rows:
-                rid = str(r[0])
-                raw_bmp_str = r[1]
-                qid_mask = self._translate_pid_bitmap(raw_bmp_str, pid_map, global_map)
-                self.bitmap_cache[(alias, rid)] = qid_mask
-                result_map[rid] = qid_mask
+            execute_start = time.perf_counter()
+            with self.timings.span('anno.execute'):
+                self.cursor.execute(sql)
+            execute_query_time += time.perf_counter() - execute_start
+            with self.timings.span('anno.fetchall'):
+                rows = self.cursor.fetchall()
+            self.timings.counters['anno.queries'] += 1
+            self.timings.counters['anno.rows_translated'] += len(rows)
+            with self.timings.span('anno.translate_and_cache_python'):
+                for r in rows:
+                    rid = str(r[0])
+                    raw_bmp_str = r[1]
+                    qid_mask = self._translate_pid_bitmap(raw_bmp_str, pid_map, global_map)
+                    self.bitmap_cache[(alias, rid)] = qid_mask
+                    result_map[rid] = qid_mask
 
         return result_map, execute_query_time
 
@@ -417,10 +435,13 @@ class WanderJoinEngine:
         return proposed_candidates, execute_query_time
     
 
+    @timed('wander_join.step')
     def extend_paths_one_step(self, active_paths, step_info, pid_map_full, global_map_full, workload_name=""):
         """
         [新增] 蒙特卡洛单步扩展：将父节点传来的所有路径，向当前表进行 1 步 Wander Join。
         """
+        self.timings.counters['wander_join.paths_in'] += len(active_paths)
+        self.timings.counters['wander_join.steps'] += 1
         self.connect()
         alias = step_info['alias']
         real_name = step_info['real_name']
@@ -432,11 +453,12 @@ class WanderJoinEngine:
         if not my_col: return[]
 
         parent_key = f"{parent_alias}.{parent_col}"
-        batch_vals = []
-        for path in active_paths:
-            val = path['vals'].get(parent_key)
-            if val: batch_vals.append(val)
-            else: path['alive'] = False
+        with self.timings.span('wander_join.collect_keys_python'):
+            batch_vals = []
+            for path in active_paths:
+                val = path['vals'].get(parent_key)
+                if val: batch_vals.append(val)
+                else: path['alive'] = False
 
         if not batch_vals: return[]
 
@@ -449,25 +471,26 @@ class WanderJoinEngine:
         pending_bitmap_ids = set()
         path_selections = {}
 
-        for i, path in enumerate(active_paths):
-            if not path.get('alive', True): continue
+        with self.timings.span('wander_join.choose_neighbors_python'):
+            for i, path in enumerate(active_paths):
+                if not path.get('alive', True): continue
             
-            p_val = str(path['vals'].get(parent_key))
-            candidates = neighbors.get(p_val,[])
+                p_val = str(path['vals'].get(parent_key))
+                candidates = neighbors.get(p_val,[])
             
-            if not candidates:
-                path['alive'] = False
-                continue
+                if not candidates:
+                    path['alive'] = False
+                    continue
 
-            # Wander Join 核心：随机选 1 个邻居
-            chosen = random.choice(candidates)
-            path_selections[i] = chosen
+                # Wander Join 核心：随机选 1 个邻居
+                chosen = random.choice(candidates)
+                path_selections[i] = chosen
 
-            chosen_id = chosen.get(f"{alias}.id") or chosen.get(f"{alias}.Id")
-            if chosen_id:
-                pending_bitmap_ids.add(chosen_id)
-            else:
-                path['alive'] = False
+                chosen_id = chosen.get(f"{alias}.id") or chosen.get(f"{alias}.Id")
+                if chosen_id:
+                    pending_bitmap_ids.add(chosen_id)
+                else:
+                    path['alive'] = False
 
         if not pending_bitmap_ids:
             return[]
@@ -479,21 +502,23 @@ class WanderJoinEngine:
         )
 
         # 组装新的存活路径列表，返回给节点缓存
-        surviving_paths =[]
-        for i, path in enumerate(active_paths):
-            if not path.get('alive', True) or i not in path_selections: continue
+        with self.timings.span('wander_join.intersection_and_path_update_python'):
+            surviving_paths =[]
+            for i, path in enumerate(active_paths):
+                if not path.get('alive', True) or i not in path_selections: continue
             
-            chosen = path_selections[i]
-            chosen_id = chosen.get(f"{alias}.id") or chosen.get(f"{alias}.Id")
-            qid_mask = translated_map.get(chosen_id, my_global_mask)
+                chosen = path_selections[i]
+                chosen_id = chosen.get(f"{alias}.id") or chosen.get(f"{alias}.Id")
+                qid_mask = translated_map.get(chosen_id, my_global_mask)
 
-            # 更新当前路径的状态
-            new_path = {
-                'vals': path['vals'].copy(),
-                'acc_bmp': path['acc_bmp'] & qid_mask,
-                'alive': True
-            }
-            new_path['vals'].update(chosen)
-            surviving_paths.append(new_path)
+                # 更新当前路径的状态
+                new_path = {
+                    'vals': path['vals'].copy(),
+                    'acc_bmp': path['acc_bmp'] & qid_mask,
+                    'alive': True
+                }
+                new_path['vals'].update(chosen)
+                surviving_paths.append(new_path)
 
+        self.timings.counters['wander_join.paths_out'] += len(surviving_paths)
         return surviving_paths

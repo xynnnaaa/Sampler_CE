@@ -632,10 +632,10 @@ class Sampler:
         print("Database connection closed.")
 
 if __name__ == "__main__":
-    sampler = Sampler("/home/Sampler_CE/single_table/workload_shift/imdb/join_drift/sampler_config.json")
+    sampler = Sampler("/home/Sampler_CE/single_table/join_complexity/imdb/sampler_config.json")
     try:
         sampler.sample()
-        sampler.save_samples("/home/Sampler_CE/single_table/workload_shift/imdb/join_drift/samples.json")
+        sampler.save_samples("/home/Sampler_CE/single_table/join_complexity/imdb/samples.json")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:

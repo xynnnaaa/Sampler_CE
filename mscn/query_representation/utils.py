@@ -1418,9 +1418,12 @@ def extract_join_graph(sql_str):
     import sqlglot
     from sqlglot import exp
 
-    # 核心安全操作：全转小写。防止下游采样器在执行 re.sub(r"\b{alias}\.", ...) 时因大小写不匹配而失效
-    sql_str = sql_str.lower()
     parsed = sqlglot.parse_one(sql_str)
+    # PostgreSQL 将未加引号的标识符折叠为小写，使图节点和谓词中的别名一致。
+    # 只修改 AST 的标识符；字符串值及带双引号的标识符必须保留原始大小写。
+    for identifier in parsed.find_all(exp.Identifier):
+        if not identifier.args.get("quoted", False):
+            identifier.set("this", identifier.this.lower())
     g = nx.Graph()
 
     # 1. 提取所有表和别名（添加为图的顶点）

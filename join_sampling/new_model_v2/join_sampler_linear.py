@@ -32,6 +32,7 @@ from sqlglot import exp
 
 from wander_join import WanderJoinEngine
 from sampling_timing import timed, timed_template
+from template_annotations import TemplateAnnotations, SharedMemoryBudget
 
 
 # --- 工具函数 ---
@@ -164,7 +165,7 @@ TABLE_CARD_TPCH = {
 
 class JoinSampler:
     def __init__(self, config_path: str):
-        print(f"Initializing JoinSampler (Linear Baseline) with config: {config_path}")
+        print(f"Initializing JoinSampler (V2 In-Memory QID) with config: {config_path}")
         with open(config_path, 'r') as f:
             self.config = json.load(f)
         
@@ -203,11 +204,23 @@ class JoinSampler:
         
         self.engine = WanderJoinEngine(self.conn, self.cursor)
         self.timings = self.engine.timings
+        # These settings affect only annotation storage/streaming, not sampling.
+        self.annotation_batch_size = samp_conf.get('annotation_batch_size', 10000)
+        self.annotation_table_stats_cache = {}
+        budget_gib = float(samp_conf.get('annotation_memory_budget_gib', 96))
+        budget_key = hashlib.sha256(os.path.abspath(config_path).encode()).hexdigest()[:20]
+        budget_path = samp_conf.get(
+            'annotation_budget_path', f'/tmp/join_sampling_v2_{budget_key}.json')
+        self.annotation_budget = SharedMemoryBudget(budget_path, int(budget_gib * 2**30))
         self.all_involved_tables = set()
 
         self.worker_id = 0
 
+    def release_template_annotations(self):
+        self.engine.close()
+
     def close(self):
+        self.release_template_annotations()
         if self.cursor: self.cursor.close()
         if self.conn: self.conn.close()
         if self.engine: self.engine.close()
@@ -481,7 +494,6 @@ class JoinSampler:
         [优化同步版] 对单个 Template 执行 Monte Carlo Random Walk。
         同步了树状结构的内部 Mini-Batch 分批与 Root 层 Top-K 掩码打分剪枝，确保公平对比。
         """
-        self.engine.bitmap_cache.clear()
 
         join_graph = template_data['graph']
         self.add_sel_info_to_graph(join_graph)
@@ -497,6 +509,12 @@ class JoinSampler:
         
         partitions = self.partition_root_table(root_info['real_name'], self.m_partitions)
         pid_map, global_map, total_qids = self.prepare_template_pid_map(instances)
+        self.engine.annotations = TemplateAnnotations(
+            self.timings, batch_size=self.annotation_batch_size,
+            budget=self.annotation_budget,
+            table_stats_cache=self.annotation_table_stats_cache)
+        self.engine.annotations.prepare(
+            self.conn, join_graph, instances, self.global_pid_to_pred)
         
         target_full_mask = (1 << total_qids) - 1
         template_covered_mask = 0
@@ -566,11 +584,8 @@ class JoinSampler:
                             root_info['real_name'], "id", chunk, root_info['sels'], root_info['alias']
                         )
 
-                        translated_map, _ = self.engine._batch_fetch_translate_bitmaps(
-                            root_info['real_name'], chunk,
-                            workload_name=self.workload_name, alias=root_info['alias'],
-                            pid_map=pid_map.get(root_info['alias'], {}),
-                            global_map=global_map.get(root_info['alias'], 0)
+                        translated_map, _ = self.engine._batch_lookup_qid_bitmaps(
+                            root_info['alias'], chunk
                         )
 
                         # 逐个元组计算局部掩码得分
@@ -755,6 +770,8 @@ class JoinSampler:
                 samples = self.sample_for_one_template(template_key, template_data)
             except Exception as e:
                 print(f"Error sampling template {template_key}: {e}")
+                # Recover the connection if preparation SQL failed.
+                self.conn.rollback()
                 samples = []
             current_batch_results[template_key] = samples
             processed += 1
